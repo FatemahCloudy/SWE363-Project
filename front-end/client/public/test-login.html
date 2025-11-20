@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Test Admin Login - Memory of Place</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .section {
+      background: white;
+      padding: 20px;
+      margin: 20px 0;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    button {
+      background: #6366f1;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+    }
+    button:hover {
+      background: #4f46e5;
+    }
+    button.danger {
+      background: #ef4444;
+    }
+    button.danger:hover {
+      background: #dc2626;
+    }
+    pre {
+      background: #1e293b;
+      color: #e2e8f0;
+      padding: 15px;
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+    .success {
+      color: #10b981;
+      font-weight: bold;
+    }
+    .error {
+      color: #ef4444;
+      font-weight: bold;
+    }
+    input {
+      width: 100%;
+      padding: 8px;
+      margin: 5px 0;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔐 Admin Login Test Tool</h1>
+  <p>Debug tool to check and fix admin login issues</p>
+
+  <div class="section">
+    <h2>1. Check Users in Storage</h2>
+    <button onclick="checkUsers()">View All Users</button>
+    <button onclick="checkAdmin()">Check Admin User</button>
+    <pre id="users-output">Click button to view users...</pre>
+  </div>
+
+  <div class="section">
+    <h2>2. Test Admin Login</h2>
+    <div>
+      <input type="text" id="username" placeholder="Username" value="admin" />
+      <input type="password" id="password" placeholder="Password" value="admin123" />
+      <button onclick="testLogin()">Test Login</button>
+    </div>
+    <pre id="login-output">Enter credentials and click Test Login...</pre>
+  </div>
+
+  <div class="section">
+    <h2>3. Fix Admin Account</h2>
+    <button onclick="fixAdmin()">Repair Admin User</button>
+    <button onclick="resetAll()" class="danger">Reset All Data</button>
+    <pre id="fix-output">Click button to fix issues...</pre>
+  </div>
+
+  <div class="section">
+    <h2>4. Current Session</h2>
+    <button onclick="checkSession()">View Current Session</button>
+    <button onclick="clearSession()" class="danger">Clear Session</button>
+    <pre id="session-output">Click button to view session...</pre>
+  </div>
+
+  <script>
+    function checkUsers() {
+      const users = JSON.parse(localStorage.getItem('memoryplace_users') || '[]');
+      document.getElementById('users-output').textContent = 
+        `Total users: ${users.length}\n\n` + 
+        JSON.stringify(users.map(u => ({
+          username: u.username,
+          email: u.email,
+          role: u.role,
+          hasPassword: !!u.password,
+          passwordLength: u.password ? u.password.length : 0
+        })), null, 2);
+    }
+
+    function checkAdmin() {
+      const users = JSON.parse(localStorage.getItem('memoryplace_users') || '[]');
+      const admin = users.find(u => u.username === 'admin');
+      
+      if (!admin) {
+        document.getElementById('users-output').innerHTML = 
+          '<span class="error">❌ Admin user NOT found!</span>';
+      } else {
+        document.getElementById('users-output').innerHTML = 
+          '<span class="success">✅ Admin user found!</span>\n\n' +
+          JSON.stringify({
+            id: admin.id,
+            username: admin.username,
+            email: admin.email,
+            role: admin.role,
+            hasPassword: !!admin.password,
+            password: admin.password,
+            fullName: admin.fullName
+          }, null, 2);
+      }
+    }
+
+    function testLogin() {
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      
+      const users = JSON.parse(localStorage.getItem('memoryplace_users') || '[]');
+      const user = users.find(u => u.username === username && u.password === password);
+      
+      if (user) {
+        const { password: _, ...safeUser } = user;
+        localStorage.setItem('memoryplace_user', JSON.stringify(safeUser));
+        
+        document.getElementById('login-output').innerHTML = 
+          '<span class="success">✅ Login successful!</span>\n\n' +
+          'User data:\n' +
+          JSON.stringify(safeUser, null, 2) +
+          '\n\n<span class="success">Session has been set. You can now go back to the app.</span>';
+      } else {
+        document.getElementById('login-output').innerHTML = 
+          '<span class="error">❌ Login failed!</span>\n\n' +
+          `Looking for user: ${username}\n` +
+          `With password: ${password}\n\n` +
+          'Available users:\n' +
+          JSON.stringify(users.map(u => ({
+            username: u.username,
+            password: u.password,
+            role: u.role
+          })), null, 2);
+      }
+    }
+
+    function fixAdmin() {
+      let users = JSON.parse(localStorage.getItem('memoryplace_users') || '[]');
+      let adminIndex = users.findIndex(u => u.username === 'admin');
+      
+      if (adminIndex === -1) {
+        // Create admin user
+        const adminUser = {
+          id: 'admin-' + Date.now(),
+          username: 'admin',
+          email: 'admin@memoryplace.com',
+          password: 'admin123',
+          fullName: 'Admin User',
+          role: 'admin',
+          bio: 'Administrator - Full access to all features',
+          avatarUrl: null,
+          coverUrl: null,
+          location: 'Memory Place HQ',
+          createdAt: new Date().toISOString(),
+        };
+        users.push(adminUser);
+        document.getElementById('fix-output').innerHTML = 
+          '<span class="success">✅ Admin user created!</span>';
+      } else {
+        // Fix existing admin
+        users[adminIndex] = {
+          ...users[adminIndex],
+          username: 'admin',
+          password: 'admin123',
+          role: 'admin',
+          email: users[adminIndex].email || 'admin@memoryplace.com',
+          fullName: users[adminIndex].fullName || 'Admin User'
+        };
+        document.getElementById('fix-output').innerHTML = 
+          '<span class="success">✅ Admin user repaired!</span>';
+      }
+      
+      localStorage.setItem('memoryplace_users', JSON.stringify(users));
+      
+      document.getElementById('fix-output').innerHTML += 
+        '\n\nFixed admin:\n' +
+        JSON.stringify(users.find(u => u.username === 'admin'), null, 2);
+    }
+
+    function resetAll() {
+      if (!confirm('This will delete ALL data and reset to demo accounts. Continue?')) {
+        return;
+      }
+      
+      localStorage.clear();
+      document.getElementById('fix-output').innerHTML = 
+        '<span class="success">✅ All data cleared!</span>\n\n' +
+        'Please refresh the main app to reinitialize demo data.';
+    }
+
+    function checkSession() {
+      const session = localStorage.getItem('memoryplace_user');
+      if (session) {
+        document.getElementById('session-output').innerHTML = 
+          '<span class="success">✅ Session active</span>\n\n' +
+          JSON.stringify(JSON.parse(session), null, 2);
+      } else {
+        document.getElementById('session-output').innerHTML = 
+          '<span class="error">❌ No active session</span>';
+      }
+    }
+
+    function clearSession() {
+      localStorage.removeItem('memoryplace_user');
+      document.getElementById('session-output').innerHTML = 
+        '<span class="success">✅ Session cleared</span>';
+    }
+
+    // Auto-check on load
+    window.addEventListener('load', () => {
+      checkUsers();
+      checkSession();
+    });
+  </script>
+</body>
+</html>

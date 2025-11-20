@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Quick Fix - Memory of Place</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }
+    .fixing { color: #3b82f6; font-size: 20px; margin: 40px 0; }
+    .info { background: #f0f9ff; padding: 15px; border-radius: 5px; margin: 20px 0; }
+  </style>
+</head>
+<body>
+  <h1>Fixing Your Account...</h1>
+  <div class="fixing">⏳ Please wait...</div>
+  <div class="info" id="message">Setting up your admin account...</div>
+  
+  <script>
+    (function() {
+      // Get current session user
+      const sessionUserStr = localStorage.getItem('memoryplace_user');
+      const sessionUser = sessionUserStr ? JSON.parse(sessionUserStr) : null;
+      
+      // Get or create users list
+      let usersStr = localStorage.getItem('memoryplace_users');
+      let users = usersStr ? JSON.parse(usersStr) : [];
+      
+      // Create the logged-in user if they don't exist
+      if (sessionUser) {
+        const userExists = users.find(u => u.id === sessionUser.id || u.username === sessionUser.username);
+        
+        if (!userExists) {
+          // Create full user record with admin role
+          const newUser = {
+            id: sessionUser.id || crypto.randomUUID(),
+            username: sessionUser.username || 'admin',
+            email: sessionUser.email || 'admin@memoryplace.com',
+            password: 'admin123',
+            fullName: sessionUser.fullName || 'Admin User',
+            role: 'admin',
+            bio: sessionUser.bio || 'Administrator',
+            avatarUrl: sessionUser.avatarUrl || null,
+            coverUrl: sessionUser.coverUrl || null,
+            location: sessionUser.location || '',
+            createdAt: sessionUser.createdAt || new Date().toISOString(),
+          };
+          
+          users.push(newUser);
+          localStorage.setItem('memoryplace_users', JSON.stringify(users));
+          
+          // Update session to ensure it has admin role
+          const updatedSession = { ...sessionUser, role: 'admin' };
+          localStorage.setItem('memoryplace_user', JSON.stringify(updatedSession));
+        } else {
+          // User exists, make them admin
+          const user = users.find(u => u.id === sessionUser.id || u.username === sessionUser.username);
+          user.role = 'admin';
+          localStorage.setItem('memoryplace_users', JSON.stringify(users));
+          
+          // Update session
+          const updatedSession = { ...sessionUser, role: 'admin' };
+          localStorage.setItem('memoryplace_user', JSON.stringify(updatedSession));
+        }
+      }
+      
+      // Initialize empty arrays if needed
+      if (!localStorage.getItem('memoryplace_memories')) {
+        localStorage.setItem('memoryplace_memories', JSON.stringify([]));
+      }
+      if (!localStorage.getItem('memoryplace_likes')) {
+        localStorage.setItem('memoryplace_likes', JSON.stringify([]));
+      }
+      if (!localStorage.getItem('memoryplace_comments')) {
+        localStorage.setItem('memoryplace_comments', JSON.stringify([]));
+      }
+      if (!localStorage.getItem('memoryplace_follows')) {
+        localStorage.setItem('memoryplace_follows', JSON.stringify([]));
+      }
+      if (!localStorage.getItem('memoryplace_saved_memories')) {
+        localStorage.setItem('memoryplace_saved_memories', JSON.stringify([]));
+      }
+      if (!localStorage.getItem('memoryplace_messages')) {
+        localStorage.setItem('memoryplace_messages', JSON.stringify([]));
+      }
+      if (!localStorage.getItem('memoryplace_notifications')) {
+        localStorage.setItem('memoryplace_notifications', JSON.stringify([]));
+      }
+      
+      document.getElementById('message').innerHTML = 
+        '<strong>✓ Done!</strong><br><br>' +
+        'Your account is now an admin.<br>' +
+        'Redirecting to home page...';
+      
+      setTimeout(() => {
+        window.location.href = '/?fixed=' + Date.now();
+      }, 1500);
+    })();
+  </script>
+</body>
+</html>
