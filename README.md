@@ -47,6 +47,42 @@ Examples:
 - Friends following the user get notified and can like/comment on the memory.
 - Memories can be retrieved later through search using keywords like "Eiffel Tower" or "Paris".
 
+ ## User Accounts
+
+To support testing and role-based access within the Memory of Place platform, the application includes two predefined user accounts. These accounts allow access to specific modules based on user roles.
+
+### Admin Account
+
+Username: admin
+
+Password: admin123
+
+Role: Administrator
+
+### Admin Capabilities
+
+- Add and edit content
+- Add locations
+- Invite users
+- Manage flagged content
+- Send notifications
+- Customize search behavior
+
+### Creator Account
+
+Username: sarah
+
+Password: sarah123
+
+Role: Creator
+
+### Creator Capabilities
+
+- Add, edit, and delete memories
+- Categorize memories
+- Search personal memories
+- Respond to comments
+- Control privacy settings
 
 ## 👥 Team Member Roles
 
