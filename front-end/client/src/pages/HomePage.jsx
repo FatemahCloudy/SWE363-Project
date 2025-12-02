@@ -6,7 +6,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Plus, MapPin, Heart, MessageCircle, Bookmark, Search, Share2, Filter } from "lucide-react";
+import { Plus, MapPin, Heart, MessageCircle, Bookmark, Search, Share2, Filter, Users } from "lucide-react";
 import { AddMemoryModal } from "@/components/modals/AddMemoryModal";
 import { useAuth } from "@/lib/auth";
 import { apiRequest, queryClient } from "@/lib/queryClient";
@@ -249,6 +249,92 @@ const CATEGORIES = [
     { value: "other", label: "Other" },
 ];
 
+function CollaborativeMemoryCard({ group }) {
+    const [, setLocation] = useLocation();
+    const { user } = useAuth();
+
+    const latestEntry = group.entries && group.entries.length > 0
+        ? group.entries[0]
+        : null;
+
+    const contributorCount = group.collaborators?.length || group.contributorCount || 0;
+
+    const displayImage = latestEntry?.imageUrl || group.coverImage || null;
+    const displayTitle = group.title;
+    const displayDescription = group.description || latestEntry?.description || '';
+    const displayLocation = group.locationAddress || latestEntry?.locationAddress || '';
+    const displayDate = latestEntry?.createdAt || group.createdAt;
+
+    return (
+        <Card
+            className="overflow-hidden hover-elevate cursor-pointer"
+            onClick={() => setLocation(`/shared-memories/${group._id || group.id}`)}
+            data-testid={`card-memory-collab-${group._id || group.id}`}
+        >
+            <CardHeader className="flex flex-row items-start gap-3 space-y-0 pb-3">
+                <div className="flex -space-x-2">
+                    {group.collaborators?.slice(0, 2).map((collab, idx) => (
+                        <Avatar key={idx} className="h-10 w-10 border-2 border-background">
+                            <AvatarImage src={collab.avatarUrl} />
+                            <AvatarFallback>{collab.username?.[0]?.toUpperCase() || '?'}</AvatarFallback>
+                        </Avatar>
+                    ))}
+                </div>
+                <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-medium truncate">
+              {group.collaborators?.[0]?.username || 'Shared'}
+                {contributorCount > 1 && ` +${contributorCount - 1}`}
+            </span>
+                        <Badge variant="secondary" className="text-xs gap-1">
+                            <Users className="h-3 w-3" />
+                            Shared
+                        </Badge>
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                        {displayDate && formatDistanceToNow(new Date(displayDate), { addSuffix: true })}
+                    </p>
+                </div>
+            </CardHeader>
+
+            {displayImage && (
+                <div className="relative aspect-video w-full overflow-hidden">
+                    <img
+                        src={displayImage}
+                        alt={displayTitle}
+                        className="object-cover w-full h-full"
+                    />
+                </div>
+            )}
+
+            <CardContent className="pt-4 space-y-2">
+                <h3 className="text-xl font-semibold" data-testid={`text-title-collab-${group._id || group.id}`}>
+                    {displayTitle}
+                </h3>
+                {displayDescription && (
+                    <p className="text-muted-foreground line-clamp-2">{displayDescription}</p>
+                )}
+                {displayLocation && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <MapPin className="h-4 w-4 flex-shrink-0" />
+                        <span className="truncate">{displayLocation}</span>
+                    </div>
+                )}
+                <p className="text-sm text-muted-foreground">
+                    {group.entries?.length || 0} memories from {contributorCount} contributor{contributorCount !== 1 ? 's' : ''}
+                </p>
+            </CardContent>
+
+            <CardFooter className="flex items-center gap-4 border-t pt-3 flex-wrap">
+                <Button variant="ghost" size="sm" className="gap-2">
+                    <Users className="h-4 w-4" />
+                    View All
+                </Button>
+            </CardFooter>
+        </Card>
+    );
+}
+
 export default function HomePage() {
     const { isAuthenticated, user } = useAuth();
     const [addMemoryOpen, setAddMemoryOpen] = useState(false);
@@ -258,6 +344,11 @@ export default function HomePage() {
 
     const { data: memories = [], isLoading } = useQuery({
         queryKey: ["/api/memories"],
+        enabled: isAuthenticated,
+    });
+
+    const { data: collaborativeGroups = { owned: [], contributing: [], invitations: [] } } = useQuery({
+        queryKey: ["/api/collaborative/my-groups"],
         enabled: isAuthenticated,
     });
 
@@ -302,6 +393,45 @@ export default function HomePage() {
     };
 
     const filteredMemories = getFilteredMemories();
+
+    const getAllItems = () => {
+        const allGroups = [...(collaborativeGroups.owned || []), ...(collaborativeGroups.contributing || [])];
+
+        const collabItems = allGroups
+            .filter(group => {
+                // Filter by privacy for public/friends tabs
+                if (activeTab === "public" && group.privacy !== "public") return false;
+                if (activeTab === "friends") {
+                    // Show groups from followed users
+                    const groupOwnerId = group.ownerId;
+                    if (!followedUserIds.includes(groupOwnerId)) return false;
+                }
+
+                // Filter by search
+                if (searchQuery === "") return true;
+                const query = searchQuery.toLowerCase();
+                return group.title?.toLowerCase().includes(query) ||
+                    group.description?.toLowerCase().includes(query) ||
+                    group.locationAddress?.toLowerCase().includes(query);
+            })
+            .map(group => ({
+                type: 'collaborative',
+                data: group,
+                sortDate: group.entries?.[0]?.createdAt || group.createdAt
+            }));
+
+        const memoryItems = filteredMemories.map(m => ({
+            type: 'memory',
+            data: m,
+            sortDate: m.createdAt
+        }));
+
+        return [...collabItems, ...memoryItems].sort((a, b) =>
+            new Date(b.sortDate) - new Date(a.sortDate)
+        );
+    };
+
+    const allItems = getAllItems();
 
     if (isLoading) {
         return (
@@ -362,7 +492,32 @@ export default function HomePage() {
                 </div>
             </div>
 
-            {filteredMemories.length === 0 ? (
+            {/* Pending Invitations - Show on My Memories tab */}
+            {activeTab === "my" && collaborativeGroups.invitations?.length > 0 && (
+                <div className="mb-6">
+                    <Card className="p-4 border-primary/30 bg-primary/5">
+                        <div className="flex items-center gap-2 mb-2">
+                            <Badge variant="default" className="bg-primary">
+                                {collaborativeGroups.invitations.length} Pending Invitation{collaborativeGroups.invitations.length > 1 ? 's' : ''}
+                            </Badge>
+                        </div>
+                        <p className="text-sm text-muted-foreground mb-2">
+                            You have been invited to collaborate on shared albums.
+                        </p>
+                        <Link href="/shared-memories">
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                data-testid="button-view-invitations"
+                            >
+                                View Invitations
+                            </Button>
+                        </Link>
+                    </Card>
+                </div>
+            )}
+
+            {allItems.length === 0 ? (
                 <Card className="text-center p-12">
                     <CardContent>
                         <MapPin className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
@@ -384,8 +539,10 @@ export default function HomePage() {
                 </Card>
             ) : (
                 <div className="space-y-6">
-                    {filteredMemories.map((memory) => (
-                        <MemoryCard key={memory.id} memory={memory} />
+                    {allItems.map((item) => (
+                        item.type === 'collaborative'
+                            ? <CollaborativeMemoryCard key={`collab-${item.data._id || item.data.id}`} group={item.data} />
+                            : <MemoryCard key={item.data.id} memory={item.data} />
                     ))}
                 </div>
             )}

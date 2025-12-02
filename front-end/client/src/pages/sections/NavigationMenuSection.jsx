@@ -10,6 +10,7 @@ import {
     Bell,
     Shield,
     Menu,
+    Users,
 } from "lucide-react";
 import React, { useState } from "react";
 import { Link, useLocation } from "wouter";
@@ -34,6 +35,12 @@ const navigationItems = [
         label: "Messages",
         icon: MessageSquareIcon,
         path: "/messages",
+    },
+    {
+        id: "shared-memories",
+        label: "Shared Albums",
+        icon: Users,
+        path: "/shared-memories",
     },
     {
         id: "saved-memory",
