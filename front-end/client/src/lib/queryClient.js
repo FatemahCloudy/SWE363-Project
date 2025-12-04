@@ -306,8 +306,8 @@ const localStorageQueryFn = async ({ queryKey }) => {
     }
 };
 
-// API Request wrapper for mutations
-export async function apiRequest(method, url, data) {
+// LocalStorage API Request wrapper for mutations
+async function localStorageApiRequest(method, url, data) {
     // Auth endpoints
     if (url === "/api/auth/login") {
         const user = localStorageAuth.login(data.username, data.password);
@@ -541,14 +541,74 @@ export async function apiRequest(method, url, data) {
     return { ok: true, json: async () => ({}) };
 }
 
+// ============================================================
+// SWITCH BETWEEN LOCALSTORAGE AND REAL BACKEND API
+// ============================================================
+// Set to FALSE to use real MongoDB backend API
+// Set to TRUE to use localStorage (offline/development mode)
+const USE_LOCAL_STORAGE = true;
+// ============================================================
+
+// Real API fetch function for backend
+const realApiQueryFn = async ({ queryKey }) => {
+    const [url, params] = queryKey;
+
+    let fullUrl = url;
+    if (params && typeof params === 'object') {
+        const searchParams = new URLSearchParams();
+        Object.entries(params).forEach(([key, value]) => {
+            if (value !== undefined && value !== null) {
+                searchParams.append(key, value);
+            }
+        });
+        const queryString = searchParams.toString();
+        if (queryString) {
+            fullUrl = `${url}?${queryString}`;
+        }
+    } else if (params && typeof params === 'string') {
+        fullUrl = `${url}?q=${encodeURIComponent(params)}`;
+    }
+
+    const response = await fetch(fullUrl, {
+        credentials: 'include',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+    });
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ message: 'API error' }));
+        throw new Error(error.message || `API error: ${response.status}`);
+    }
+
+    return response.json();
+};
+
+// Real API mutation function for backend
+const realApiRequest = async (method, url, data) => {
+    const response = await fetch(url, {
+        method: method,
+        credentials: 'include',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: data ? JSON.stringify(data) : undefined,
+    });
+
+    return response;
+};
+
+// Export the appropriate apiRequest function based on mode
+export const apiRequest = USE_LOCAL_STORAGE ? localStorageApiRequest : realApiRequest;
+
 export const queryClient = new QueryClient({
     defaultOptions: {
         queries: {
-            queryFn: localStorageQueryFn,
+            queryFn: USE_LOCAL_STORAGE ? localStorageQueryFn : realApiQueryFn,
             refetchInterval: false,
-            refetchOnWindowFocus: false,
-            staleTime: Infinity,
-            retry: false,
+            refetchOnWindowFocus: USE_LOCAL_STORAGE ? false : true,
+            staleTime: USE_LOCAL_STORAGE ? Infinity : 5 * 60 * 1000,
+            retry: USE_LOCAL_STORAGE ? false : 1,
         },
         mutations: {
             retry: false,
