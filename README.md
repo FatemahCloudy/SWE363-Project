@@ -9,7 +9,7 @@ The platform also allows users to search for certain memories or places and appl
 
 ---
 
-## ⚙️ Setup and Installation
+## ⚙️Frontend Setup and Installation
 
 1. Clone the repository:
 ```
@@ -33,8 +33,149 @@ npm install
 npm run dev
 ```
 
+## ⚙️Backend Setup and Installation
 
-🚀 Usage
+1. Navigate to the back-end folder:
+   ```
+   cd SWE363-Project/back-end
+   ```
+
+5. Start the development server:
+```
+node server.js
+```
+
+
+3. Backend runs at
+```
+http://localhost:6001/api
+```
+
+
+## 📌 API Documentation
+Below is the main REST API documentation for authentication & memories.
+
+## 🔐 AUTH APIs:
+1️⃣ Signup :POST /api/auth/signup:
+
+-  request body :
+  ```
+  {
+  "username": "sara",
+  "email": "sara@example.com",
+  "password": "sara123",
+  "fullName": "Sara Ali"
+```
+
+-  success response:
+```
+  {
+  "id": "6923fd31a934b9e055316bcc",
+  "username": "sara",
+  "email": "sara@example.com"
+}
+```
+
+✅ Login: POST /api/auth/login:
+
+  - request body :
+ ```
+  {
+  "identifier": "sara",
+  "password": "sara123"
+}
+
+```
+
+
+ - Response:
+```
+{
+  "message": "Login successful",
+  "token": "JWT_TOKEN_HERE",
+  "user": {
+    "id": "6923fd31a934b9e055316bcc",
+    "username": "sara",
+    "email": "sara@example.com"
+  }
+}
+```
+
+
+✅ Get Current User : GET /api/auth/me
+
+( Requires Authorization → Bearer TOKEN) 
+
+
+✅ LogOut:  POST /api/auth/logout
+
+
+## 📸 Memory APIs
+- 📍 Get All Memorie :GET /api/memories (Requires token)
+
+```
+- Response:
+   {
+  "success": true,
+  "count": 0,
+  "data": []
+   }
+```
+
+- 📍 Create Memory : POST /api/memories
+
+- Body Example:
+```
+{
+  "title": "Sara Wedding",
+  "description": "A beautiful night celebrating Sara's wedding.",
+  "category": "family",
+  "privacy": "public"
+}
+```
+
+-Response:
+   ``` 
+{
+  "success": true,
+  "data": {
+    "title": "Sara Wedding",
+    "category": "family"
+  }
+}
+```
+
+
+- 📍Get Memory by ID : GET /api/memories/:id
+
+
+- 📍 Update Memory : PUT /api/memories/:id
+
+- 📍 Delete Memory : DELETE /api/memories/:id
+
+## 💬 Comment APIs
+- Add Comment: POST /api/memories/:id/comments
+```
+- Body:
+{
+  "content": "Beautiful memory!"
+}
+```
+
+## ❤️ Reaction APIs
+- Like Memory : POST /api/memories/:id/like
+
+- Unlike Memory : DELETE /api/memories/:id/like
+
+## 🔍  Search API
+- Search Memories : GET /api/memories/search?keyword=paris
+
+## 👤  User APIs 
+- Get User Memories : GET /api/memories/user/:userId
+
+
+
+## 🚀 Usage
 
 - Upload memories (photos, videos, comments).
 - Set visibility: Public, Group-specific, or Private.
@@ -113,7 +254,7 @@ Role: Creator
 
 ---
 
-### 3. Viewer Module – **Maryam Zakariya**
+### 3. Viewer Module – **Maryam Almobarak**
 
 #### 🔧 Functionalities implemented on React
 - Browse public memories  
