@@ -549,9 +549,45 @@ async function localStorageApiRequest(method, url, data) {
 const USE_LOCAL_STORAGE = true;
 // ============================================================
 
+// JWT Token management for real backend API
+const TOKEN_KEY = 'auth_token';
+const USER_KEY = 'current_user';
+
+const getStoredToken = () => localStorage.getItem(TOKEN_KEY);
+const setStoredToken = (token) => localStorage.setItem(TOKEN_KEY, token);
+const removeStoredToken = () => localStorage.removeItem(TOKEN_KEY);
+
+const getStoredUser = () => {
+    const user = localStorage.getItem(USER_KEY);
+    return user ? JSON.parse(user) : null;
+};
+const setStoredUser = (user) => localStorage.setItem(USER_KEY, JSON.stringify(user));
+const removeStoredUser = () => localStorage.removeItem(USER_KEY);
+
+// Build headers with Authorization token
+const getAuthHeaders = () => {
+    const headers = {
+        'Content-Type': 'application/json',
+    };
+    const token = getStoredToken();
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+    return headers;
+};
+
 // Real API fetch function for backend
 const realApiQueryFn = async ({ queryKey }) => {
     const [url, params] = queryKey;
+
+    // Special case: return stored user for /api/auth/me
+    if (url === '/api/auth/me') {
+        const user = getStoredUser();
+        if (!user) {
+            throw new Error('Not authenticated');
+        }
+        return user;
+    }
 
     let fullUrl = url;
     if (params && typeof params === 'object') {
@@ -571,17 +607,17 @@ const realApiQueryFn = async ({ queryKey }) => {
 
     const response = await fetch(fullUrl, {
         credentials: 'include',
-        headers: {
-            'Content-Type': 'application/json',
-        },
+        headers: getAuthHeaders(),
     });
 
     if (!response.ok) {
         const error = await response.json().catch(() => ({ message: 'API error' }));
-        throw new Error(error.message || `API error: ${response.status}`);
+        throw new Error(error.message || error.error || `API error: ${response.status}`);
     }
 
-    return response.json();
+    const data = await response.json();
+    // Handle wrapped responses { success: true, data: ... }
+    return data.data || data;
 };
 
 // Real API mutation function for backend
@@ -589,11 +625,35 @@ const realApiRequest = async (method, url, data) => {
     const response = await fetch(url, {
         method: method,
         credentials: 'include',
-        headers: {
-            'Content-Type': 'application/json',
-        },
+        headers: getAuthHeaders(),
         body: data ? JSON.stringify(data) : undefined,
     });
+
+    // Handle login response - store token and user
+    if (url === '/api/auth/login' && response.ok) {
+        const clonedResponse = response.clone();
+        const result = await clonedResponse.json();
+        if (result.success && result.token) {
+            setStoredToken(result.token);
+            setStoredUser(result.user);
+        }
+    }
+
+    // Handle logout - clear stored data
+    if (url === '/api/auth/logout') {
+        removeStoredToken();
+        removeStoredUser();
+    }
+
+    // Handle signup response - store token and user
+    if (url === '/api/auth/signup' && response.ok) {
+        const clonedResponse = response.clone();
+        const result = await clonedResponse.json();
+        if (result.success && result.token) {
+            setStoredToken(result.token);
+            setStoredUser(result.user);
+        }
+    }
 
     return response;
 };
