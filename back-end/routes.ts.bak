@@ -1,0 +1,2610 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { db } from "./db";
+import { 
+  memories, reactions, comments, follows, savedMemories, messages, notifications, users, reports, contents, locations, moderationActions,
+  adminNotifications, innovations, securityLogs, searchSettings,
+  insertUserSchema, insertMemorySchema, insertReactionSchema, insertCommentSchema, 
+  insertFollowSchema, insertSavedMemorySchema, insertMessageSchema, insertReportSchema, insertContentSchema, insertLocationSchema,
+  insertModerationActionSchema, adminCreateUserSchema, insertAdminNotificationSchema, insertInnovationSchema,
+  insertSecurityLogSchema, insertSearchSettingsSchema, updatePasswordSchema, updateEmailSchema,
+  loginSchema, type SafeUser, ContentStatus, MediaType, LocationCategory, UserStatus, ModerationActionType,
+  NotificationAudience, NotificationChannel, NotificationDeliveryStatus, IdeaStatus, ImpactLevel, SecurityActionType
+} from "@shared/schema";
+import { eq, and, or, desc, sql, inArray } from "drizzle-orm";
+import bcrypt from "bcryptjs";
+
+// Helper function to sanitize user (remove password)
+function sanitizeUser(user: any): SafeUser {
+  const { password, ...userWithoutPassword } = user;
+  return userWithoutPassword;
+}
+
+// Extend session type
+declare module "express-session" {
+  interface SessionData {
+    userId?: string;
+    role?: string;
+  }
+}
+
+// Middleware to check authentication
+const requireAuth = (req: Request, res: Response, next: NextFunction) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+};
+
+// Middleware to check role
+const requireRole = (...roles: string[]) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    if (!roles.includes(req.session.role || "")) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  };
+};
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Authentication routes
+  app.post("/api/auth/signup", async (req, res) => {
+    try {
+      const validatedData = insertUserSchema.parse(req.body);
+      
+      // Check if user already exists
+      const existingUser = await db.select().from(users)
+        .where(eq(users.username, validatedData.username));
+      
+      if (existingUser.length > 0) {
+        return res.status(400).json({ error: "Username already exists" });
+      }
+
+      const existingEmail = await db.select().from(users)
+        .where(eq(users.email, validatedData.email));
+      
+      if (existingEmail.length > 0) {
+        return res.status(400).json({ error: "Email already exists" });
+      }
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(validatedData.password, 10);
+      
+      // Force default user role for all signups - admins can only be created server-side
+      const { role, ...safeUserData } = validatedData;
+      
+      // Create user
+      const newUser = await db.insert(users).values({
+        ...safeUserData,
+        password: hashedPassword,
+        role: "user", // Always default to user role (can create and view)
+      }).returning();
+
+      // Create session and save it
+      req.session.userId = newUser[0].id;
+      req.session.role = newUser[0].role;
+
+      // Save session before sending response
+      req.session.save((err) => {
+        if (err) {
+          console.error("Session save error:", err);
+          return res.status(500).json({ error: "Failed to create session" });
+        }
+        // Return sanitized user
+        res.status(201).json(sanitizeUser(newUser[0]));
+      });
+    } catch (error: any) {
+      console.error("Signup error:", error);
+      res.status(400).json({ error: error.message || "Failed to create account" });
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      // Validate request body
+      const validatedData = loginSchema.parse(req.body);
+
+      // Find user
+      const userResult = await db.select().from(users)
+        .where(eq(users.username, validatedData.username));
+
+      if (userResult.length === 0) {
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+
+      const user = userResult[0];
+
+      // Check password
+      const isValid = await bcrypt.compare(validatedData.password, user.password);
+      
+      if (!isValid) {
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+
+      // Create session and save it
+      req.session.userId = user.id;
+      req.session.role = user.role;
+
+      // Save session before sending response
+      req.session.save((err) => {
+        if (err) {
+          console.error("Session save error:", err);
+          return res.status(500).json({ error: "Failed to create session" });
+        }
+        // Return sanitized user
+        res.json(sanitizeUser(user));
+      });
+    } catch (error: any) {
+      console.error("Login error:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ error: "Invalid request data" });
+      }
+      res.status(500).json({ error: "Failed to login" });
+    }
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    req.session.destroy((err) => {
+      if (err) {
+        return res.status(500).json({ error: "Failed to logout" });
+      }
+      res.json({ message: "Logged out successfully" });
+    });
+  });
+
+  app.get("/api/auth/me", requireAuth, async (req, res) => {
+    try {
+      const userResult = await db.select().from(users)
+        .where(eq(users.id, req.session.userId!));
+
+      if (userResult.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      res.json(sanitizeUser(userResult[0]));
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch user" });
+    }
+  });
+
+  // Memory routes
+  app.get("/api/memories/search", requireAuth, async (req, res) => {
+    try {
+      const currentUserId = req.session.userId!;
+      const { q, category, privacy, userId } = req.query;
+      
+      // Get list of users the current user follows
+      const followedUsers = await db
+        .select({ followingId: follows.followingId })
+        .from(follows)
+        .where(eq(follows.followerId, currentUserId));
+      
+      const followedUserIds = followedUsers.map(f => f.followingId);
+      
+      let query = db
+        .select({
+          id: memories.id,
+          userId: memories.userId,
+          title: memories.title,
+          description: memories.description,
+          imageUrl: memories.imageUrl,
+          category: memories.category,
+          privacy: memories.privacy,
+          location: memories.location,
+          locationAddress: memories.locationAddress,
+          latitude: memories.latitude,
+          longitude: memories.longitude,
+          createdAt: memories.createdAt,
+          updatedAt: memories.updatedAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(memories)
+        .innerJoin(users, eq(memories.userId, users.id));
+      
+      // Apply privacy filtering at SQL level
+      let privacyConditions;
+      
+      if (followedUserIds.length > 0) {
+        // User follows people, include followers_only visibility
+        privacyConditions = or(
+          eq(memories.privacy, "public"),
+          eq(memories.userId, currentUserId),
+          and(
+            eq(memories.privacy, "followers_only"),
+            inArray(memories.userId, followedUserIds)
+          )
+        );
+      } else {
+        // User follows nobody, only show public and own memories
+        privacyConditions = or(
+          eq(memories.privacy, "public"),
+          eq(memories.userId, currentUserId)
+        );
+      }
+      
+      // Apply search and filter conditions
+      const conditions = [privacyConditions!];
+      
+      if (q) {
+        // Search in title, description, and location
+        const searchTerm = `%${q}%`;
+        conditions.push(sql`(
+          ${memories.title} ILIKE ${searchTerm} OR
+          ${memories.description} ILIKE ${searchTerm} OR
+          ${memories.location} ILIKE ${searchTerm} OR
+          ${memories.locationAddress} ILIKE ${searchTerm}
+        )`);
+      }
+      
+      if (category) {
+        conditions.push(eq(memories.category, category as string));
+      }
+      
+      if (privacy) {
+        conditions.push(eq(memories.privacy, privacy as string));
+      }
+      
+      if (userId) {
+        conditions.push(eq(memories.userId, userId as string));
+      }
+      
+      query = query.where(and(...conditions)) as typeof query;
+      
+      const results = await query.orderBy(desc(memories.createdAt));
+      res.json(results);
+    } catch (error) {
+      console.error("Search memories error:", error);
+      res.status(500).json({ error: "Failed to search memories" });
+    }
+  });
+
+  app.get("/api/memories", requireAuth, async (req, res) => {
+    try {
+      const currentUserId = req.session.userId!;
+      
+      // Get list of users the current user follows
+      const followedUsers = await db
+        .select({ followingId: follows.followingId })
+        .from(follows)
+        .where(eq(follows.followerId, currentUserId));
+      
+      const followedUserIds = followedUsers.map(f => f.followingId);
+      
+      // Build SQL conditions for privacy filtering
+      // Memory is visible if:
+      // 1. It's public, OR
+      // 2. Current user is the owner, OR
+      // 3. It's followers_only AND current user follows the owner
+      let visibilityConditions;
+      
+      if (followedUserIds.length > 0) {
+        // User follows people, include followers_only visibility
+        visibilityConditions = or(
+          eq(memories.privacy, "public"),
+          eq(memories.userId, currentUserId),
+          and(
+            eq(memories.privacy, "followers_only"),
+            inArray(memories.userId, followedUserIds)
+          )
+        );
+      } else {
+        // User follows nobody, only show public and own memories
+        visibilityConditions = or(
+          eq(memories.privacy, "public"),
+          eq(memories.userId, currentUserId)
+        );
+      }
+      
+      // Fetch only visible memories directly from database
+      const visibleMemories = await db
+        .select({
+          id: memories.id,
+          userId: memories.userId,
+          title: memories.title,
+          description: memories.description,
+          imageUrl: memories.imageUrl,
+          category: memories.category,
+          privacy: memories.privacy,
+          location: memories.location,
+          locationAddress: memories.locationAddress,
+          latitude: memories.latitude,
+          longitude: memories.longitude,
+          createdAt: memories.createdAt,
+          updatedAt: memories.updatedAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(memories)
+        .innerJoin(users, eq(memories.userId, users.id))
+        .where(visibilityConditions!)
+        .orderBy(desc(memories.createdAt));
+      
+      res.json(visibleMemories);
+    } catch (error) {
+      console.error("Get memories error:", error);
+      res.status(500).json({ error: "Failed to fetch memories" });
+    }
+  });
+
+  app.get("/api/memories/:id", requireAuth, async (req, res) => {
+    try {
+      const currentUserId = req.session.userId!;
+      
+      // Get list of users the current user follows
+      const followedUsers = await db
+        .select({ followingId: follows.followingId })
+        .from(follows)
+        .where(eq(follows.followerId, currentUserId));
+      
+      const followedUserIds = followedUsers.map(f => f.followingId);
+      
+      const memory = await db
+        .select({
+          id: memories.id,
+          userId: memories.userId,
+          title: memories.title,
+          description: memories.description,
+          imageUrl: memories.imageUrl,
+          category: memories.category,
+          privacy: memories.privacy,
+          location: memories.location,
+          locationAddress: memories.locationAddress,
+          latitude: memories.latitude,
+          longitude: memories.longitude,
+          createdAt: memories.createdAt,
+          updatedAt: memories.updatedAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(memories)
+        .innerJoin(users, eq(memories.userId, users.id))
+        .where(eq(memories.id, req.params.id));
+      
+      if (memory.length === 0) {
+        return res.status(404).json({ error: "Memory not found" });
+      }
+      
+      const memoryData = memory[0];
+      
+      // Check if user has permission to view this memory
+      const isOwner = memoryData.userId === currentUserId;
+      const isPublic = memoryData.privacy === "public";
+      const isPrivate = memoryData.privacy === "private";
+      const isFollowersOnly = memoryData.privacy === "followers_only";
+      const isFollower = followedUserIds.includes(memoryData.userId);
+      
+      // Deny access if:
+      // 1. Memory is private and user is not the owner, OR
+      // 2. Memory is followers_only and user is not the owner and not a follower
+      if (isPrivate && !isOwner) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+      
+      if (isFollowersOnly && !isOwner && !isFollower) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+      
+      res.json(memoryData);
+    } catch (error) {
+      console.error("Get memory by ID error:", error);
+      res.status(500).json({ error: "Failed to fetch memory" });
+    }
+  });
+
+  app.post("/api/memories", requireAuth, async (req, res) => {
+    try {
+      // Validate and sanitize input
+      const validatedData = insertMemorySchema.parse(req.body);
+      
+      // Ensure userId comes from session, not client
+      const newMemory = await db.insert(memories).values({
+        ...validatedData,
+        userId: req.session.userId!,
+      }).returning();
+      res.status(201).json(newMemory[0]);
+    } catch (error: any) {
+      console.error("Create memory error:", error);
+      res.status(400).json({ error: error.message || "Failed to create memory" });
+    }
+  });
+
+  app.put("/api/memories/:id", requireAuth, async (req, res) => {
+    try {
+      // Check if memory exists and belongs to user (or user is admin)
+      const existing = await db.select().from(memories).where(eq(memories.id, req.params.id));
+      if (existing.length === 0) {
+        return res.status(404).json({ error: "Memory not found" });
+      }
+      if (existing[0].userId !== req.session.userId && req.session.role !== "admin") {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      // Validate input (partial schema for updates)
+      const validatedData = insertMemorySchema.partial().parse(req.body);
+      
+      const updated = await db.update(memories)
+        .set(validatedData)
+        .where(eq(memories.id, req.params.id))
+        .returning();
+      res.json(updated[0]);
+    } catch (error: any) {
+      console.error("Update memory error:", error);
+      res.status(400).json({ error: error.message || "Failed to update memory" });
+    }
+  });
+
+  app.delete("/api/memories/:id", requireAuth, async (req, res) => {
+    try {
+      // Check if memory exists and belongs to user (or user is admin)
+      const existing = await db.select().from(memories).where(eq(memories.id, req.params.id));
+      if (existing.length === 0) {
+        return res.status(404).json({ error: "Memory not found" });
+      }
+      if (existing[0].userId !== req.session.userId && req.session.role !== "admin") {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      await db.delete(memories).where(eq(memories.id, req.params.id));
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ error: "Failed to delete memory" });
+    }
+  });
+
+  app.post("/api/memories/:id/like", requireAuth, async (req, res) => {
+    try {
+      // Validate input
+      const validatedData = insertReactionSchema.partial().parse(req.body);
+      
+      // Get memory details to get the owner's userId
+      const memory = await db.select().from(memories)
+        .where(eq(memories.id, req.params.id));
+      
+      if (memory.length === 0) {
+        return res.status(404).json({ error: "Memory not found" });
+      }
+      
+      // Get liker's username for notification
+      const likerUser = await db.select().from(users)
+        .where(eq(users.id, req.session.userId!));
+      
+      // Explicitly construct with server-controlled fields
+      const newReaction = await db.insert(reactions).values({
+        userId: req.session.userId!,
+        memoryId: req.params.id,
+        type: validatedData.type || "like",
+      }).returning();
+      
+      // Create notification for the memory owner (don't notify if you like your own memory)
+      if (memory[0].userId !== req.session.userId) {
+        await db.insert(notifications).values({
+          userId: memory[0].userId,
+          type: "like",
+          content: `${likerUser[0].username} liked your memory "${memory[0].title}"`,
+          relatedUserId: req.session.userId!,
+          relatedMemoryId: req.params.id,
+        });
+      }
+      
+      res.status(201).json(newReaction[0]);
+    } catch (error: any) {
+      console.error("React error:", error);
+      res.status(400).json({ error: error.message || "Failed to react to memory" });
+    }
+  });
+
+  app.delete("/api/memories/:id/like", requireAuth, async (req, res) => {
+    try {
+      // Ensure userId comes from session
+      await db.delete(reactions).where(
+        and(
+          eq(reactions.memoryId, req.params.id),
+          eq(reactions.userId, req.session.userId!)
+        )
+      );
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ error: "Failed to remove reaction" });
+    }
+  });
+
+  app.get("/api/memories/:id/reactions", requireAuth, async (req, res) => {
+    try {
+      const currentUserId = req.session.userId!;
+      
+      // First check if user has access to this memory
+      const memory = await db.select({
+        userId: memories.userId,
+        privacy: memories.privacy,
+      })
+        .from(memories)
+        .where(eq(memories.id, req.params.id));
+      
+      if (memory.length === 0) {
+        return res.status(404).json({ error: "Memory not found" });
+      }
+      
+      const memoryData = memory[0];
+      
+      // Check authorization
+      const isOwner = memoryData.userId === currentUserId;
+      const isPublic = memoryData.privacy === "public";
+      
+      if (!isOwner && !isPublic) {
+        // For private and followers_only, check if user follows the owner
+        const followedUsers = await db
+          .select({ followingId: follows.followingId })
+          .from(follows)
+          .where(eq(follows.followerId, currentUserId));
+        
+        const followedUserIds = followedUsers.map(f => f.followingId);
+        const isFollowerAndAllowed = memoryData.privacy === "followers_only" && followedUserIds.includes(memoryData.userId);
+        
+        if (!isFollowerAndAllowed) {
+          return res.status(403).json({ error: "Access denied" });
+        }
+      }
+      
+      // User has access, return reactions
+      const memoryReactions = await db.select().from(reactions)
+        .where(eq(reactions.memoryId, req.params.id));
+      res.json(memoryReactions);
+    } catch (error) {
+      console.error("Get reactions error:", error);
+      res.status(500).json({ error: "Failed to fetch reactions" });
+    }
+  });
+
+  app.get("/api/memories/:id/comments", requireAuth, async (req, res) => {
+    try {
+      const currentUserId = req.session.userId!;
+      
+      // First check if user has access to this memory
+      const memory = await db.select({
+        userId: memories.userId,
+        privacy: memories.privacy,
+      })
+        .from(memories)
+        .where(eq(memories.id, req.params.id));
+      
+      if (memory.length === 0) {
+        return res.status(404).json({ error: "Memory not found" });
+      }
+      
+      const memoryData = memory[0];
+      
+      // Check authorization
+      const isOwner = memoryData.userId === currentUserId;
+      const isPublic = memoryData.privacy === "public";
+      
+      if (!isOwner && !isPublic) {
+        // For private and followers_only, check if user follows the owner
+        const followedUsers = await db
+          .select({ followingId: follows.followingId })
+          .from(follows)
+          .where(eq(follows.followerId, currentUserId));
+        
+        const followedUserIds = followedUsers.map(f => f.followingId);
+        const isFollowerAndAllowed = memoryData.privacy === "followers_only" && followedUserIds.includes(memoryData.userId);
+        
+        if (!isFollowerAndAllowed) {
+          return res.status(403).json({ error: "Access denied" });
+        }
+      }
+      
+      // User has access, return comments
+      const memoryComments = await db
+        .select({
+          id: comments.id,
+          userId: comments.userId,
+          memoryId: comments.memoryId,
+          content: comments.content,
+          createdAt: comments.createdAt,
+          updatedAt: comments.updatedAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(comments)
+        .innerJoin(users, eq(comments.userId, users.id))
+        .where(eq(comments.memoryId, req.params.id))
+        .orderBy(desc(comments.createdAt));
+      res.json(memoryComments);
+    } catch (error) {
+      console.error("Get comments error:", error);
+      res.status(500).json({ error: "Failed to fetch comments" });
+    }
+  });
+
+  app.post("/api/memories/:id/comments", requireAuth, async (req, res) => {
+    try {
+      // Validate input
+      const validatedData = insertCommentSchema.parse({ content: req.body.content });
+      
+      // Explicitly construct with server-controlled fields
+      const newComment = await db.insert(comments).values({
+        userId: req.session.userId!,
+        memoryId: req.params.id,
+        content: validatedData.content,
+      }).returning();
+      res.status(201).json(newComment[0]);
+    } catch (error: any) {
+      console.error("Comment error:", error);
+      res.status(400).json({ error: error.message || "Failed to create comment" });
+    }
+  });
+
+  app.get("/api/users/:id", requireAuth, async (req, res) => {
+    try {
+      const user = await db.select().from(users).where(eq(users.id, req.params.id));
+      if (user.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      res.json(sanitizeUser(user[0]));
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch user" });
+    }
+  });
+
+  // Update current user's profile
+  app.put("/api/user/profile", requireAuth, async (req, res) => {
+    try {
+      // Validate input using partial schema
+      const validatedData = insertUserSchema.partial().parse(req.body);
+      
+      // Build safe update object with only allowed fields
+      const safeUpdateData: any = {};
+      const allowedFields = ['fullName', 'email', 'phone', 'gender', 'birthdate', 'bio', 'location', 'locationAddress', 'avatarUrl', 'coverUrl'];
+      
+      for (const field of allowedFields) {
+        if (validatedData[field as keyof typeof validatedData] !== undefined) {
+          safeUpdateData[field] = validatedData[field as keyof typeof validatedData];
+        }
+      }
+      
+      // Update updatedAt timestamp
+      safeUpdateData.updatedAt = new Date();
+      
+      const updated = await db.update(users)
+        .set(safeUpdateData)
+        .where(eq(users.id, req.session.userId!))
+        .returning();
+      
+      if (updated.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      res.json(sanitizeUser(updated[0]));
+    } catch (error: any) {
+      console.error("Update user profile error:", error);
+      res.status(400).json({ error: error.message || "Failed to update profile" });
+    }
+  });
+
+  app.put("/api/users/:id", requireAuth, async (req, res) => {
+    try {
+      // Only allow users to update their own profile (or admins)
+      if (req.session.userId !== req.params.id && req.session.role !== "admin") {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      // Validate input using partial schema
+      const validatedData = insertUserSchema.partial().parse(req.body);
+      
+      // Build safe update object with only allowed fields
+      const safeUpdateData: any = {};
+      const allowedFields = ['fullName', 'phone', 'gender', 'birthdate', 'bio', 'location', 'locationAddress', 'avatarUrl', 'coverUrl'];
+      
+      for (const field of allowedFields) {
+        if (validatedData[field as keyof typeof validatedData] !== undefined) {
+          safeUpdateData[field] = validatedData[field as keyof typeof validatedData];
+        }
+      }
+      
+      // Allow admins to change roles, but regular users cannot
+      if (validatedData.role && req.session.role === "admin") {
+        safeUpdateData.role = validatedData.role;
+      }
+      
+      const updated = await db.update(users)
+        .set(safeUpdateData)
+        .where(eq(users.id, req.params.id))
+        .returning();
+      if (updated.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      res.json(sanitizeUser(updated[0]));
+    } catch (error: any) {
+      console.error("Update user error:", error);
+      res.status(400).json({ error: error.message || "Failed to update user" });
+    }
+  });
+
+  // Saved memories routes
+  app.post("/api/saved-memories", requireAuth, async (req, res) => {
+    try {
+      const validatedData = insertSavedMemorySchema.parse({ memoryId: req.body.memoryId });
+      
+      const newSavedMemory = await db.insert(savedMemories).values({
+        userId: req.session.userId!,
+        memoryId: validatedData.memoryId,
+      }).returning();
+      res.status(201).json(newSavedMemory[0]);
+    } catch (error: any) {
+      console.error("Save memory error:", error);
+      // Handle unique constraint violation
+      if (error.code === '23505') {
+        return res.status(400).json({ error: "Memory already saved" });
+      }
+      res.status(400).json({ error: error.message || "Failed to save memory" });
+    }
+  });
+
+  app.delete("/api/saved-memories/:memoryId", requireAuth, async (req, res) => {
+    try {
+      await db.delete(savedMemories).where(
+        and(
+          eq(savedMemories.userId, req.session.userId!),
+          eq(savedMemories.memoryId, req.params.memoryId)
+        )
+      );
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ error: "Failed to unsave memory" });
+    }
+  });
+
+  app.get("/api/saved-memories", requireAuth, async (req, res) => {
+    try {
+      const saved = await db
+        .select({
+          id: savedMemories.id,
+          savedAt: savedMemories.createdAt,
+          memory: memories,
+          user: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          },
+        })
+        .from(savedMemories)
+        .innerJoin(memories, eq(savedMemories.memoryId, memories.id))
+        .innerJoin(users, eq(memories.userId, users.id))
+        .where(eq(savedMemories.userId, req.session.userId!))
+        .orderBy(desc(savedMemories.createdAt));
+      
+      res.json(saved);
+    } catch (error) {
+      console.error("Get saved memories error:", error);
+      res.status(500).json({ error: "Failed to fetch saved memories" });
+    }
+  });
+
+  // Check if memory is saved by current user
+  app.get("/api/saved-memories/check/:memoryId", requireAuth, async (req, res) => {
+    try {
+      const saved = await db.select().from(savedMemories)
+        .where(
+          and(
+            eq(savedMemories.userId, req.session.userId!),
+            eq(savedMemories.memoryId, req.params.memoryId)
+          )
+        );
+      res.json({ isSaved: saved.length > 0 });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to check saved status" });
+    }
+  });
+
+  // Report memory endpoint
+  app.post("/api/reports", requireAuth, async (req, res) => {
+    try {
+      const validatedData = insertReportSchema.parse({
+        memoryId: req.body.memoryId,
+        reason: req.body.reason,
+      });
+
+      const newReport = await db.insert(reports).values({
+        reporterId: req.session.userId!,
+        memoryId: validatedData.memoryId,
+        reason: validatedData.reason,
+      }).returning();
+
+      res.status(201).json(newReport[0]);
+    } catch (error: any) {
+      console.error("Report memory error:", error);
+      res.status(400).json({ error: error.message || "Failed to submit report" });
+    }
+  });
+
+  // User search route
+  app.get("/api/users/search", async (req, res) => {
+    try {
+      const { q } = req.query;
+      
+      if (!q || typeof q !== 'string') {
+        return res.json([]);
+      }
+      
+      const searchTerm = `%${q}%`;
+      const userResults = await db
+        .select({
+          id: users.id,
+          username: users.username,
+          name: users.fullName,
+          avatarUrl: users.avatarUrl,
+          bio: users.bio,
+          location: users.location,
+        })
+        .from(users)
+        .where(sql`(
+          ${users.username} ILIKE ${searchTerm} OR
+          ${users.fullName} ILIKE ${searchTerm}
+        )`)
+        .limit(20);
+      
+      res.json(userResults);
+    } catch (error) {
+      console.error("Search users error:", error);
+      res.status(500).json({ error: "Failed to search users" });
+    }
+  });
+
+  // User profile routes
+  app.get("/api/users/profile/:username", async (req, res) => {
+    try {
+      const userResult = await db.select().from(users)
+        .where(eq(users.username, req.params.username));
+      
+      if (userResult.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      
+      // Get follower and following counts
+      const followerCount = await db.select().from(follows)
+        .where(eq(follows.followingId, userResult[0].id));
+      
+      const followingCount = await db.select().from(follows)
+        .where(eq(follows.followerId, userResult[0].id));
+      
+      // Get memory count
+      const memoryCount = await db.select().from(memories)
+        .where(eq(memories.userId, userResult[0].id));
+      
+      const profileData = {
+        ...sanitizeUser(userResult[0]),
+        followerCount: followerCount.length,
+        followingCount: followingCount.length,
+        memoryCount: memoryCount.length,
+      };
+      
+      res.json(profileData);
+    } catch (error) {
+      console.error("Get user profile error:", error);
+      res.status(500).json({ error: "Failed to fetch user profile" });
+    }
+  });
+
+  // Get user by ID
+  app.get("/api/users/:userId", async (req, res) => {
+    try {
+      const userResult = await db.select().from(users)
+        .where(eq(users.id, req.params.userId));
+      
+      if (userResult.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      
+      res.json(sanitizeUser(userResult[0]));
+    } catch (error) {
+      console.error("Get user error:", error);
+      res.status(500).json({ error: "Failed to fetch user" });
+    }
+  });
+
+  app.get("/api/users/:userId/memories", requireAuth, async (req, res) => {
+    try {
+      const currentUserId = req.session.userId!;
+      const targetUserId = req.params.userId;
+      
+      // Check if current user follows the target user
+      const isFollowing = await db
+        .select()
+        .from(follows)
+        .where(
+          and(
+            eq(follows.followerId, currentUserId),
+            eq(follows.followingId, targetUserId)
+          )
+        );
+      
+      const doesFollow = isFollowing.length > 0;
+      const isOwnProfile = currentUserId === targetUserId;
+      
+      // Build privacy filter relative to target user
+      // Show: public always, followers_only if following target, private only if own profile
+      let privacyFilter;
+      
+      if (isOwnProfile) {
+        // Own profile: show all memories
+        privacyFilter = sql`true`;
+      } else if (doesFollow) {
+        // Following target: show public and followers_only
+        privacyFilter = or(
+          eq(memories.privacy, "public"),
+          eq(memories.privacy, "followers_only")
+        );
+      } else {
+        // Not following: show only public
+        privacyFilter = eq(memories.privacy, "public");
+      }
+      
+      const userMemories = await db
+        .select({
+          id: memories.id,
+          userId: memories.userId,
+          title: memories.title,
+          description: memories.description,
+          imageUrl: memories.imageUrl,
+          category: memories.category,
+          privacy: memories.privacy,
+          location: memories.location,
+          locationAddress: memories.locationAddress,
+          latitude: memories.latitude,
+          longitude: memories.longitude,
+          createdAt: memories.createdAt,
+          updatedAt: memories.updatedAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(memories)
+        .innerJoin(users, eq(memories.userId, users.id))
+        .where(and(
+          eq(memories.userId, targetUserId),
+          privacyFilter!
+        ))
+        .orderBy(desc(memories.createdAt));
+      
+      res.json(userMemories);
+    } catch (error) {
+      console.error("Get user memories error:", error);
+      res.status(500).json({ error: "Failed to fetch user memories" });
+    }
+  });
+
+  // Follow/unfollow routes
+  app.post("/api/follows", requireAuth, async (req, res) => {
+    try {
+      const validatedData = insertFollowSchema.parse({
+        followingId: req.body.followingId,
+      });
+      
+      // Prevent self-follow
+      if (req.session.userId === validatedData.followingId) {
+        return res.status(400).json({ error: "Cannot follow yourself" });
+      }
+      
+      // Check if already following
+      const existing = await db.select().from(follows)
+        .where(
+          and(
+            eq(follows.followerId, req.session.userId!),
+            eq(follows.followingId, validatedData.followingId)
+          )
+        );
+      
+      if (existing.length > 0) {
+        return res.status(400).json({ error: "Already following this user" });
+      }
+      
+      // Get follower's username for notification
+      const followerUser = await db.select().from(users)
+        .where(eq(users.id, req.session.userId!));
+      
+      const newFollow = await db.insert(follows).values({
+        followerId: req.session.userId!,
+        followingId: validatedData.followingId,
+      }).returning();
+      
+      // Create notification for the user being followed
+      await db.insert(notifications).values({
+        userId: validatedData.followingId,
+        type: "follow",
+        content: `${followerUser[0].username} started following you`,
+        relatedUserId: req.session.userId!,
+      });
+      
+      res.status(201).json(newFollow[0]);
+    } catch (error: any) {
+      console.error("Follow user error:", error);
+      res.status(400).json({ error: error.message || "Failed to follow user" });
+    }
+  });
+
+  app.delete("/api/follows/:followingId", requireAuth, async (req, res) => {
+    try {
+      await db.delete(follows).where(
+        and(
+          eq(follows.followerId, req.session.userId!),
+          eq(follows.followingId, req.params.followingId)
+        )
+      );
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ error: "Failed to unfollow user" });
+    }
+  });
+
+  app.get("/api/follows/check/:userId", requireAuth, async (req, res) => {
+    try {
+      const following = await db.select().from(follows)
+        .where(
+          and(
+            eq(follows.followerId, req.session.userId!),
+            eq(follows.followingId, req.params.userId)
+          )
+        );
+      res.json({ isFollowing: following.length > 0 });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to check follow status" });
+    }
+  });
+
+  app.get("/api/users/:userId/followers", async (req, res) => {
+    try {
+      const followers = await db
+        .select({
+          id: follows.id,
+          createdAt: follows.createdAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            fullName: users.fullName,
+            avatarUrl: users.avatarUrl,
+            bio: users.bio,
+          }
+        })
+        .from(follows)
+        .innerJoin(users, eq(follows.followerId, users.id))
+        .where(eq(follows.followingId, req.params.userId))
+        .orderBy(desc(follows.createdAt));
+      
+      res.json(followers);
+    } catch (error) {
+      console.error("Get followers error:", error);
+      res.status(500).json({ error: "Failed to fetch followers" });
+    }
+  });
+
+  app.get("/api/users/:userId/following", async (req, res) => {
+    try {
+      const following = await db
+        .select({
+          id: follows.id,
+          createdAt: follows.createdAt,
+          user: {
+            id: users.id,
+            username: users.username,
+            fullName: users.fullName,
+            avatarUrl: users.avatarUrl,
+            bio: users.bio,
+          }
+        })
+        .from(follows)
+        .innerJoin(users, eq(follows.followingId, users.id))
+        .where(eq(follows.followerId, req.params.userId))
+        .orderBy(desc(follows.createdAt));
+      
+      res.json(following);
+    } catch (error) {
+      console.error("Get following error:", error);
+      res.status(500).json({ error: "Failed to fetch following" });
+    }
+  });
+
+  // Get all conversations for current user
+  app.get("/api/conversations", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      
+      // Get all messages where user is sender or receiver
+      const allMessages = await db
+        .select({
+          id: messages.id,
+          senderId: messages.senderId,
+          receiverId: messages.receiverId,
+          content: messages.content,
+          isRead: messages.isRead,
+          createdAt: messages.createdAt,
+          sender: {
+            id: users.id,
+            username: users.username,
+            fullName: users.fullName,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(messages)
+        .innerJoin(users, eq(messages.senderId, users.id))
+        .where(sql`${messages.senderId} = ${userId} OR ${messages.receiverId} = ${userId}`)
+        .orderBy(desc(messages.createdAt));
+      
+      // Group by conversation partner
+      const conversationsMap = new Map();
+      
+      for (const msg of allMessages) {
+        const partnerId = msg.senderId === userId ? msg.receiverId : msg.senderId;
+        
+        if (!conversationsMap.has(partnerId)) {
+          // Get partner info
+          const partnerInfo = await db.select({
+            id: users.id,
+            username: users.username,
+            fullName: users.fullName,
+            avatarUrl: users.avatarUrl,
+          }).from(users).where(eq(users.id, partnerId));
+          
+          if (partnerInfo.length > 0) {
+            conversationsMap.set(partnerId, {
+              partner: partnerInfo[0],
+              lastMessage: msg,
+              unreadCount: 0,
+            });
+          }
+        }
+        
+        // Count unread messages (messages sent to current user that are unread)
+        if (msg.receiverId === userId && !msg.isRead) {
+          const conv = conversationsMap.get(partnerId);
+          if (conv) {
+            conv.unreadCount += 1;
+          }
+        }
+      }
+      
+      const conversations = Array.from(conversationsMap.values());
+      res.json(conversations);
+    } catch (error) {
+      console.error("Get conversations error:", error);
+      res.status(500).json({ error: "Failed to fetch conversations" });
+    }
+  });
+
+  // Get messages for a specific conversation
+  app.get("/api/messages/conversation/:partnerId", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      const partnerId = req.params.partnerId;
+      
+      const conversationMessages = await db
+        .select({
+          id: messages.id,
+          senderId: messages.senderId,
+          receiverId: messages.receiverId,
+          content: messages.content,
+          isRead: messages.isRead,
+          createdAt: messages.createdAt,
+          sender: {
+            id: users.id,
+            username: users.username,
+            fullName: users.fullName,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(messages)
+        .innerJoin(users, eq(messages.senderId, users.id))
+        .where(
+          sql`(${messages.senderId} = ${userId} AND ${messages.receiverId} = ${partnerId}) 
+              OR (${messages.senderId} = ${partnerId} AND ${messages.receiverId} = ${userId})`
+        )
+        .orderBy(messages.createdAt);
+      
+      // Mark messages as read
+      await db.update(messages)
+        .set({ isRead: true })
+        .where(
+          and(
+            eq(messages.receiverId, userId),
+            eq(messages.senderId, partnerId),
+            eq(messages.isRead, false)
+          )
+        );
+      
+      res.json(conversationMessages);
+    } catch (error) {
+      console.error("Get conversation messages error:", error);
+      res.status(500).json({ error: "Failed to fetch conversation messages" });
+    }
+  });
+
+  app.post("/api/messages", requireAuth, async (req, res) => {
+    try {
+      // Validate input - omit senderId as it comes from session
+      const validatedData = insertMessageSchema.omit({ senderId: true }).parse({ 
+        receiverId: req.body.receiverId,
+        content: req.body.content 
+      });
+      
+      // Explicitly construct with server-controlled fields
+      const newMessage = await db.insert(messages).values({
+        senderId: req.session.userId!,
+        receiverId: validatedData.receiverId,
+        content: validatedData.content,
+      }).returning();
+      res.status(201).json(newMessage[0]);
+    } catch (error: any) {
+      console.error("Message error:", error);
+      res.status(400).json({ error: error.message || "Failed to send message" });
+    }
+  });
+
+  // Notifications endpoints
+  app.get("/api/notifications", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      const userNotifications = await db
+        .select({
+          id: notifications.id,
+          type: notifications.type,
+          content: notifications.content,
+          isRead: notifications.isRead,
+          createdAt: notifications.createdAt,
+          relatedUser: {
+            id: users.id,
+            username: users.username,
+            avatarUrl: users.avatarUrl,
+          }
+        })
+        .from(notifications)
+        .leftJoin(users, eq(notifications.relatedUserId, users.id))
+        .where(eq(notifications.userId, userId))
+        .orderBy(desc(notifications.createdAt));
+      res.json(userNotifications);
+    } catch (error) {
+      console.error("Get notifications error:", error);
+      res.status(500).json({ error: "Failed to fetch notifications" });
+    }
+  });
+
+  app.get("/api/notifications/unread-count", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      const unreadNotifications = await db.select().from(notifications)
+        .where(
+          and(
+            eq(notifications.userId, userId),
+            eq(notifications.isRead, false)
+          )
+        );
+      res.json({ count: unreadNotifications.length });
+    } catch (error) {
+      console.error("Get unread count error:", error);
+      res.status(500).json({ error: "Failed to fetch unread count" });
+    }
+  });
+
+  app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      
+      // Verify ownership
+      const notification = await db.select().from(notifications)
+        .where(eq(notifications.id, req.params.id));
+      
+      if (notification.length === 0) {
+        return res.status(404).json({ error: "Notification not found" });
+      }
+      
+      if (notification[0].userId !== userId) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      
+      const updated = await db.update(notifications)
+        .set({ isRead: true })
+        .where(eq(notifications.id, req.params.id))
+        .returning();
+      
+      res.json(updated[0]);
+    } catch (error) {
+      console.error("Mark notification read error:", error);
+      res.status(500).json({ error: "Failed to mark notification as read" });
+    }
+  });
+
+  app.patch("/api/notifications/mark-all-read", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      
+      await db.update(notifications)
+        .set({ isRead: true })
+        .where(
+          and(
+            eq(notifications.userId, userId),
+            eq(notifications.isRead, false)
+          )
+        );
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Mark all read error:", error);
+      res.status(500).json({ error: "Failed to mark all notifications as read" });
+    }
+  });
+
+  // Admin endpoints
+  app.get("/api/admin/stats", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const [totalUsers] = await db.select({ count: sql<number>`count(*)` }).from(users);
+      const [totalMemories] = await db.select({ count: sql<number>`count(*)` }).from(memories);
+      const [totalLikes] = await db.select({ count: sql<number>`count(*)` }).from(reactions);
+      const [totalComments] = await db.select({ count: sql<number>`count(*)` }).from(comments);
+      const [pendingReportsCount] = await db.select({ count: sql<number>`count(*)` }).from(reports).where(eq(reports.status, "pending"));
+      
+      res.json({
+        totalUsers: Number(totalUsers.count),
+        totalMemories: Number(totalMemories.count),
+        totalLikes: Number(totalLikes.count),
+        totalComments: Number(totalComments.count),
+        pendingReports: Number(pendingReportsCount.count),
+      });
+    } catch (error) {
+      console.error("Get admin stats error:", error);
+      res.status(500).json({ error: "Failed to fetch statistics" });
+    }
+  });
+
+  app.get("/api/admin/users", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const allUsers = await db.select().from(users).orderBy(desc(users.createdAt));
+      res.json(allUsers.map(sanitizeUser));
+    } catch (error) {
+      console.error("Get all users error:", error);
+      res.status(500).json({ error: "Failed to fetch users" });
+    }
+  });
+
+  app.post("/api/admin/users", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = adminCreateUserSchema.parse(req.body);
+      
+      // Check if username already exists
+      const existingUser = await db.select().from(users)
+        .where(eq(users.username, validatedData.username));
+      
+      if (existingUser.length > 0) {
+        return res.status(400).json({ error: "Username already exists" });
+      }
+
+      // Check if email already exists
+      const existingEmail = await db.select().from(users)
+        .where(eq(users.email, validatedData.email));
+      
+      if (existingEmail.length > 0) {
+        return res.status(400).json({ error: "Email already exists" });
+      }
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(validatedData.password, 10);
+      
+      // Create user with admin-specified role and status
+      const newUser = await db.insert(users).values({
+        ...validatedData,
+        password: hashedPassword,
+        status: validatedData.status || UserStatus.ACTIVE,
+      }).returning();
+
+      res.status(201).json(sanitizeUser(newUser[0]));
+    } catch (error: any) {
+      console.error("Admin create user error:", error);
+      res.status(400).json({ error: error.message || "Failed to create user" });
+    }
+  });
+
+  app.put("/api/admin/users/:userId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { role, status } = req.body;
+
+      // Validate role if provided
+      if (role && !Object.values({ ADMIN: "admin", USER: "user" }).includes(role)) {
+        return res.status(400).json({ error: "Invalid role" });
+      }
+
+      // Validate status if provided
+      if (status && !Object.values(UserStatus).includes(status)) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+
+      // Prevent changing own role or status
+      if (userId === req.session.userId && (role || status)) {
+        return res.status(400).json({ error: "Cannot modify your own role or status" });
+      }
+
+      const updates: any = { updatedAt: new Date() };
+      if (role !== undefined) updates.role = role;
+      if (status !== undefined) updates.status = status;
+
+      const updated = await db
+        .update(users)
+        .set(updates)
+        .where(eq(users.id, userId))
+        .returning();
+
+      if (updated.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      res.json(sanitizeUser(updated[0]));
+    } catch (error: any) {
+      console.error("Admin update user error:", error);
+      res.status(400).json({ error: error.message || "Failed to update user" });
+    }
+  });
+
+  app.delete("/api/admin/users/:userId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { userId } = req.params;
+      
+      // Prevent deleting self
+      if (userId === req.session.userId) {
+        return res.status(400).json({ error: "Cannot delete your own account" });
+      }
+      
+      // Delete all related data first to avoid foreign key constraint violations
+      
+      // First, get the user's memories to clean up related notifications
+      const userMemories = await db.select({ id: memories.id }).from(memories).where(eq(memories.userId, userId));
+      const memoryIds = userMemories.map(m => m.id);
+      
+      // Delete notifications related to this user
+      await db.delete(notifications).where(eq(notifications.userId, userId));
+      await db.delete(notifications).where(eq(notifications.relatedUserId, userId));
+      
+      // Delete notifications related to user's memories
+      if (memoryIds.length > 0) {
+        await db.delete(notifications).where(inArray(notifications.relatedMemoryId, memoryIds));
+      }
+      
+      // Update reports reviewed by this user (set reviewedBy to null)
+      await db.update(reports).set({ reviewedBy: null }).where(eq(reports.reviewedBy, userId));
+      
+      // Delete comments by this user
+      await db.delete(comments).where(eq(comments.userId, userId));
+      
+      // Delete reactions/likes by this user
+      await db.delete(reactions).where(eq(reactions.userId, userId));
+      
+      // Delete saved memories by this user
+      await db.delete(savedMemories).where(eq(savedMemories.userId, userId));
+      
+      // Delete reports by this user
+      await db.delete(reports).where(eq(reports.reporterId, userId));
+      
+      // Delete follows where user is follower or following
+      await db.delete(follows).where(eq(follows.followerId, userId));
+      await db.delete(follows).where(eq(follows.followingId, userId));
+      
+      // Delete messages sent or received by this user
+      await db.delete(messages).where(eq(messages.senderId, userId));
+      await db.delete(messages).where(eq(messages.receiverId, userId));
+      
+      // Delete memories created by this user (and related data)
+      if (memoryIds.length > 0) {
+        // Delete comments on user's memories
+        await db.delete(comments).where(inArray(comments.memoryId, memoryIds));
+        
+        // Delete reactions on user's memories
+        await db.delete(reactions).where(inArray(reactions.memoryId, memoryIds));
+        
+        // Delete saved references to user's memories
+        await db.delete(savedMemories).where(inArray(savedMemories.memoryId, memoryIds));
+        
+        // Delete reports on user's memories
+        await db.delete(reports).where(inArray(reports.memoryId, memoryIds));
+        
+        // Finally delete the memories themselves
+        await db.delete(memories).where(eq(memories.userId, userId));
+      }
+      
+      // Finally delete the user
+      await db.delete(users).where(eq(users.id, userId));
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete user error:", error);
+      res.status(500).json({ error: "Failed to delete user" });
+    }
+  });
+
+  // Get all reports with details
+  app.get("/api/admin/reports", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const allReports = await db
+        .select({
+          id: reports.id,
+          reason: reports.reason,
+          status: reports.status,
+          createdAt: reports.createdAt,
+          reporterId: reports.reporterId,
+          reporterUsername: users.username,
+          reporterAvatar: users.avatarUrl,
+          memoryId: reports.memoryId,
+          memoryTitle: memories.title,
+          memoryImage: memories.imageUrl,
+          memoryUserId: memories.userId,
+        })
+        .from(reports)
+        .innerJoin(users, eq(reports.reporterId, users.id))
+        .innerJoin(memories, eq(reports.memoryId, memories.id))
+        .orderBy(desc(reports.createdAt));
+
+      // Get memory owner usernames
+      const memoryUserIds = Array.from(new Set(allReports.map(r => r.memoryUserId)));
+      const memoryUsers = await db
+        .select({ id: users.id, username: users.username })
+        .from(users)
+        .where(inArray(users.id, memoryUserIds));
+      
+      const memoryUserMap = new Map(memoryUsers.map(u => [u.id, u.username]));
+
+      const formattedReports = allReports.map(report => ({
+        id: report.id,
+        reason: report.reason,
+        status: report.status,
+        createdAt: report.createdAt,
+        reporter: {
+          id: report.reporterId,
+          username: report.reporterUsername,
+          avatarUrl: report.reporterAvatar,
+        },
+        memory: {
+          id: report.memoryId,
+          title: report.memoryTitle,
+          imageUrl: report.memoryImage,
+          userId: report.memoryUserId,
+          user: {
+            username: memoryUserMap.get(report.memoryUserId) || "Unknown",
+          },
+        },
+      }));
+
+      res.json(formattedReports);
+    } catch (error) {
+      console.error("Get reports error:", error);
+      res.status(500).json({ error: "Failed to fetch reports" });
+    }
+  });
+
+  // Review a report (dismiss or delete memory)
+  app.post("/api/admin/reports/:reportId/review", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { reportId } = req.params;
+      const { action } = req.body;
+
+      if (!action || !["dismiss", "delete"].includes(action)) {
+        return res.status(400).json({ error: "Invalid action" });
+      }
+
+      // Get report details
+      const [report] = await db.select().from(reports).where(eq(reports.id, reportId));
+      
+      if (!report) {
+        return res.status(404).json({ error: "Report not found" });
+      }
+
+      if (action === "dismiss") {
+        // Mark report as reviewed/dismissed
+        await db
+          .update(reports)
+          .set({
+            status: "dismissed",
+            reviewedBy: req.session.userId,
+            reviewedAt: new Date(),
+          })
+          .where(eq(reports.id, reportId));
+      } else if (action === "delete") {
+        // Delete the reported memory
+        await db.delete(memories).where(eq(memories.id, report.memoryId));
+        
+        // Mark report as reviewed
+        await db
+          .update(reports)
+          .set({
+            status: "reviewed",
+            reviewedBy: req.session.userId,
+            reviewedAt: new Date(),
+          })
+          .where(eq(reports.id, reportId));
+      }
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Review report error:", error);
+      res.status(500).json({ error: "Failed to review report" });
+    }
+  });
+
+  // Moderation actions endpoint
+  app.post("/api/admin/moderation/actions", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = insertModerationActionSchema.parse(req.body);
+      
+      // Execute the moderation action based on type
+      if (validatedData.actionType === ModerationActionType.WARN_USER && validatedData.targetUserId) {
+        // Update user status to warned
+        await db
+          .update(users)
+          .set({ status: UserStatus.WARNED, updatedAt: new Date() })
+          .where(eq(users.id, validatedData.targetUserId));
+      } else if (validatedData.actionType === ModerationActionType.BAN_USER && validatedData.targetUserId) {
+        // Update user status to banned
+        await db
+          .update(users)
+          .set({ status: UserStatus.BANNED, updatedAt: new Date() })
+          .where(eq(users.id, validatedData.targetUserId));
+      } else if (validatedData.actionType === ModerationActionType.UNBAN_USER && validatedData.targetUserId) {
+        // Update user status to active
+        await db
+          .update(users)
+          .set({ status: UserStatus.ACTIVE, updatedAt: new Date() })
+          .where(eq(users.id, validatedData.targetUserId));
+      } else if (validatedData.actionType === ModerationActionType.REMOVE_CONTENT && validatedData.targetMemoryId) {
+        // Delete the memory
+        await db.delete(memories).where(eq(memories.id, validatedData.targetMemoryId));
+      } else if (validatedData.actionType === ModerationActionType.APPROVE_REPORT && validatedData.reportId) {
+        // Mark report as reviewed
+        await db
+          .update(reports)
+          .set({
+            status: "reviewed",
+            reviewedBy: req.session.userId,
+            reviewedAt: new Date(),
+          })
+          .where(eq(reports.id, validatedData.reportId));
+      } else if (validatedData.actionType === ModerationActionType.DISMISS_REPORT && validatedData.reportId) {
+        // Mark report as dismissed
+        await db
+          .update(reports)
+          .set({
+            status: "dismissed",
+            reviewedBy: req.session.userId,
+            reviewedAt: new Date(),
+          })
+          .where(eq(reports.id, validatedData.reportId));
+      }
+
+      // Log the moderation action
+      const moderationAction = await db.insert(moderationActions).values({
+        ...validatedData,
+        moderatorId: req.session.userId!,
+      }).returning();
+
+      res.status(201).json(moderationAction[0]);
+    } catch (error: any) {
+      console.error("Moderation action error:", error);
+      res.status(400).json({ error: error.message || "Failed to execute moderation action" });
+    }
+  });
+
+  // Get moderation actions log
+  app.get("/api/admin/moderation/actions", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const actions = await db
+        .select({
+          id: moderationActions.id,
+          actionType: moderationActions.actionType,
+          reason: moderationActions.reason,
+          notes: moderationActions.notes,
+          createdAt: moderationActions.createdAt,
+          moderatorId: moderationActions.moderatorId,
+          moderatorUsername: users.username,
+          targetUserId: moderationActions.targetUserId,
+          targetMemoryId: moderationActions.targetMemoryId,
+          reportId: moderationActions.reportId,
+        })
+        .from(moderationActions)
+        .innerJoin(users, eq(moderationActions.moderatorId, users.id))
+        .orderBy(desc(moderationActions.createdAt));
+
+      res.json(actions);
+    } catch (error) {
+      console.error("Get moderation actions error:", error);
+      res.status(500).json({ error: "Failed to fetch moderation actions" });
+    }
+  });
+
+  // Admin Content Management routes
+  app.get("/api/admin/contents", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const allContents = await db
+        .select({
+          id: contents.id,
+          title: contents.title,
+          description: contents.description,
+          tags: contents.tags,
+          mediaUrl: contents.mediaUrl,
+          mediaType: contents.mediaType,
+          publishAt: contents.publishAt,
+          status: contents.status,
+          createdBy: contents.createdBy,
+          createdAt: contents.createdAt,
+          updatedAt: contents.updatedAt,
+          creatorUsername: users.username,
+        })
+        .from(contents)
+        .innerJoin(users, eq(contents.createdBy, users.id))
+        .orderBy(desc(contents.createdAt));
+      
+      res.json(allContents);
+    } catch (error) {
+      console.error("Get all contents error:", error);
+      res.status(500).json({ error: "Failed to fetch contents" });
+    }
+  });
+
+  app.post("/api/admin/contents", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = insertContentSchema.parse(req.body);
+      
+      // Check for duplicate title
+      const existing = await db.select().from(contents).where(eq(contents.title, validatedData.title));
+      if (existing.length > 0) {
+        return res.status(400).json({ error: "A content with this title already exists" });
+      }
+
+      // Validate media type and URL consistency
+      if (validatedData.mediaUrl && validatedData.mediaType === MediaType.NONE) {
+        return res.status(400).json({ error: "Media type must be specified when media URL is provided" });
+      }
+      if (!validatedData.mediaUrl && validatedData.mediaType && validatedData.mediaType !== MediaType.NONE) {
+        return res.status(400).json({ error: "Media URL must be provided when media type is specified" });
+      }
+
+      const newContent = await db.insert(contents).values({
+        ...validatedData,
+        publishAt: validatedData.publishAt ? new Date(validatedData.publishAt) : null,
+        createdBy: req.session.userId!,
+      }).returning();
+
+      res.status(201).json(newContent[0]);
+    } catch (error: any) {
+      console.error("Create content error:", error);
+      res.status(400).json({ error: error.message || "Failed to create content" });
+    }
+  });
+
+  app.get("/api/admin/contents/:contentId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const [content] = await db
+        .select()
+        .from(contents)
+        .where(eq(contents.id, req.params.contentId));
+      
+      if (!content) {
+        return res.status(404).json({ error: "Content not found" });
+      }
+
+      res.json(content);
+    } catch (error) {
+      console.error("Get content error:", error);
+      res.status(500).json({ error: "Failed to fetch content" });
+    }
+  });
+
+  app.put("/api/admin/contents/:contentId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { contentId } = req.params;
+      const validatedData = insertContentSchema.parse(req.body);
+
+      // Fetch existing content to merge with incoming data
+      const [existingContent] = await db
+        .select()
+        .from(contents)
+        .where(eq(contents.id, contentId));
+
+      if (!existingContent) {
+        return res.status(404).json({ error: "Content not found" });
+      }
+
+      // Check if title is being changed and if new title already exists
+      if (validatedData.title && validatedData.title !== existingContent.title) {
+        const existing = await db
+          .select()
+          .from(contents)
+          .where(eq(contents.title, validatedData.title));
+        
+        if (existing.length > 0) {
+          return res.status(400).json({ error: "A content with this title already exists" });
+        }
+      }
+
+      // Build merged data with proper null/empty handling for media fields
+      const isMediaUrlCleared = validatedData.hasOwnProperty('mediaUrl') && 
+        (validatedData.mediaUrl === null || validatedData.mediaUrl === undefined || validatedData.mediaUrl === '');
+      const isMediaTypeSetToNone = validatedData.hasOwnProperty('mediaType') && validatedData.mediaType === MediaType.NONE;
+
+      // Build initial merged data
+      const mergedData: any = {
+        ...existingContent,
+        ...validatedData,
+        publishAt: validatedData.publishAt ? new Date(validatedData.publishAt) : (validatedData.hasOwnProperty('publishAt') ? null : existingContent.publishAt),
+      };
+
+      // Apply media field synchronization rules
+      if (isMediaUrlCleared) {
+        mergedData.mediaUrl = null;
+        // If mediaType wasn't explicitly changed, reset it to NONE
+        if (!validatedData.hasOwnProperty('mediaType')) {
+          mergedData.mediaType = MediaType.NONE;
+        }
+      }
+
+      if (isMediaTypeSetToNone) {
+        // If mediaUrl wasn't explicitly changed, clear it
+        if (!validatedData.hasOwnProperty('mediaUrl')) {
+          mergedData.mediaUrl = null;
+        }
+      }
+
+      // Validate media type and URL consistency on merged data
+      if (mergedData.mediaUrl && mergedData.mediaType === MediaType.NONE) {
+        return res.status(400).json({ error: "Media type must be specified when media URL is provided" });
+      }
+      if (!mergedData.mediaUrl && mergedData.mediaType && mergedData.mediaType !== MediaType.NONE) {
+        return res.status(400).json({ error: "Media URL must be provided when media type is specified" });
+      }
+
+      // Build final update payload from validated merged data
+      // Extract only the fields that should be updated based on what was provided in the request
+      const updatePayload: any = {
+        updatedAt: new Date(),
+      };
+      
+      // Copy fields that were explicitly provided in the request
+      if (validatedData.hasOwnProperty('title')) updatePayload.title = mergedData.title;
+      if (validatedData.hasOwnProperty('description')) updatePayload.description = mergedData.description;
+      if (validatedData.hasOwnProperty('tags')) updatePayload.tags = mergedData.tags;
+      if (validatedData.hasOwnProperty('status')) updatePayload.status = mergedData.status;
+      if (validatedData.hasOwnProperty('publishAt')) updatePayload.publishAt = mergedData.publishAt;
+      
+      // Always update both media fields together to maintain consistency
+      if (validatedData.hasOwnProperty('mediaUrl') || validatedData.hasOwnProperty('mediaType')) {
+        updatePayload.mediaUrl = mergedData.mediaUrl;
+        updatePayload.mediaType = mergedData.mediaType;
+      }
+
+      const updated = await db
+        .update(contents)
+        .set(updatePayload)
+        .where(eq(contents.id, contentId))
+        .returning();
+
+      res.json(updated[0]);
+    } catch (error: any) {
+      console.error("Update content error:", error);
+      res.status(400).json({ error: error.message || "Failed to update content" });
+    }
+  });
+
+  app.delete("/api/admin/contents/:contentId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { contentId } = req.params;
+      await db.delete(contents).where(eq(contents.id, contentId));
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete content error:", error);
+      res.status(500).json({ error: "Failed to delete content" });
+    }
+  });
+
+  // Admin Location Management routes
+  app.get("/api/admin/locations", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const allLocations = await db
+        .select({
+          id: locations.id,
+          name: locations.name,
+          address: locations.address,
+          latitude: locations.latitude,
+          longitude: locations.longitude,
+          category: locations.category,
+          createdBy: locations.createdBy,
+          createdAt: locations.createdAt,
+          updatedAt: locations.updatedAt,
+          creatorUsername: users.username,
+        })
+        .from(locations)
+        .innerJoin(users, eq(locations.createdBy, users.id))
+        .orderBy(desc(locations.createdAt));
+      
+      res.json(allLocations);
+    } catch (error) {
+      console.error("Get all locations error:", error);
+      res.status(500).json({ error: "Failed to fetch locations" });
+    }
+  });
+
+  app.post("/api/admin/locations", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = insertLocationSchema.parse(req.body);
+      
+      // Check for duplicate address
+      const existing = await db.select().from(locations).where(eq(locations.address, validatedData.address));
+      if (existing.length > 0) {
+        return res.status(400).json({ error: "A location with this address already exists" });
+      }
+
+      const newLocation = await db.insert(locations).values({
+        ...validatedData,
+        latitude: validatedData.latitude.toString(),
+        longitude: validatedData.longitude.toString(),
+        createdBy: req.session.userId!,
+      }).returning();
+
+      res.status(201).json(newLocation[0]);
+    } catch (error: any) {
+      console.error("Create location error:", error);
+      res.status(400).json({ error: error.message || "Failed to create location" });
+    }
+  });
+
+  app.get("/api/admin/locations/:locationId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const [location] = await db
+        .select()
+        .from(locations)
+        .where(eq(locations.id, req.params.locationId));
+      
+      if (!location) {
+        return res.status(404).json({ error: "Location not found" });
+      }
+
+      res.json(location);
+    } catch (error) {
+      console.error("Get location error:", error);
+      res.status(500).json({ error: "Failed to fetch location" });
+    }
+  });
+
+  app.put("/api/admin/locations/:locationId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { locationId } = req.params;
+      const validatedData = insertLocationSchema.parse(req.body);
+
+      // Fetch existing location
+      const [existingLocation] = await db
+        .select()
+        .from(locations)
+        .where(eq(locations.id, locationId));
+
+      if (!existingLocation) {
+        return res.status(404).json({ error: "Location not found" });
+      }
+
+      // Check if address is being changed and if new address already exists
+      if (validatedData.address && validatedData.address !== existingLocation.address) {
+        const existing = await db
+          .select()
+          .from(locations)
+          .where(eq(locations.address, validatedData.address));
+        
+        if (existing.length > 0) {
+          return res.status(400).json({ error: "A location with this address already exists" });
+        }
+      }
+
+      const updated = await db
+        .update(locations)
+        .set({
+          ...validatedData,
+          latitude: validatedData.latitude.toString(),
+          longitude: validatedData.longitude.toString(),
+          updatedAt: new Date(),
+        })
+        .where(eq(locations.id, locationId))
+        .returning();
+
+      res.json(updated[0]);
+    } catch (error: any) {
+      console.error("Update location error:", error);
+      res.status(400).json({ error: error.message || "Failed to update location" });
+    }
+  });
+
+  app.delete("/api/admin/locations/:locationId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { locationId } = req.params;
+      await db.delete(locations).where(eq(locations.id, locationId));
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete location error:", error);
+      res.status(500).json({ error: "Failed to delete location" });
+    }
+  });
+
+  // Admin Notification Management
+  app.get("/api/admin/notifications", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const notificationList = await db
+        .select({
+          id: adminNotifications.id,
+          title: adminNotifications.title,
+          message: adminNotifications.message,
+          audience: adminNotifications.audience,
+          channel: adminNotifications.channel,
+          scheduledFor: adminNotifications.scheduledFor,
+          status: adminNotifications.status,
+          createdBy: adminNotifications.createdBy,
+          createdAt: adminNotifications.createdAt,
+          sentAt: adminNotifications.sentAt,
+          creator: {
+            id: users.id,
+            username: users.username,
+            email: users.email,
+          },
+        })
+        .from(adminNotifications)
+        .leftJoin(users, eq(adminNotifications.createdBy, users.id))
+        .orderBy(desc(adminNotifications.createdAt));
+
+      res.json(notificationList);
+    } catch (error) {
+      console.error("Get notifications error:", error);
+      res.status(500).json({ error: "Failed to fetch notifications" });
+    }
+  });
+
+  app.post("/api/admin/notifications", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = insertAdminNotificationSchema.parse(req.body);
+      
+      // Check if title already exists
+      const existing = await db
+        .select()
+        .from(adminNotifications)
+        .where(eq(adminNotifications.title, validatedData.title));
+      
+      if (existing.length > 0) {
+        return res.status(400).json({ error: "A notification with this title already exists" });
+      }
+
+      // Determine status based on scheduling
+      let status = NotificationDeliveryStatus.SENT;
+      let sentAt: Date | null = new Date();
+      
+      if (validatedData.scheduledFor) {
+        const scheduledDate = new Date(validatedData.scheduledFor);
+        if (scheduledDate > new Date()) {
+          status = NotificationDeliveryStatus.SCHEDULED as any;
+          sentAt = null;
+        }
+      }
+
+      const insertData: any = {
+        title: validatedData.title,
+        message: validatedData.message,
+        audience: validatedData.audience || NotificationAudience.ALL_USERS,
+        channel: validatedData.channel || NotificationChannel.IN_APP,
+        createdBy: req.session.userId!,
+        status,
+        sentAt,
+      };
+
+      if (validatedData.scheduledFor) {
+        insertData.scheduledFor = new Date(validatedData.scheduledFor);
+      }
+
+      const notification = await db
+        .insert(adminNotifications)
+        .values(insertData)
+        .returning();
+
+      // If sending immediately to in-app, create user notifications
+      if (status === NotificationDeliveryStatus.SENT && 
+          (validatedData.channel === NotificationChannel.IN_APP || validatedData.channel === NotificationChannel.BOTH)) {
+        
+        let targetUsers: any[] = [];
+        
+        if (validatedData.audience === NotificationAudience.ALL_USERS) {
+          targetUsers = await db.select({ id: users.id }).from(users);
+        } else if (validatedData.audience === NotificationAudience.CREATORS) {
+          targetUsers = await db.select({ id: users.id }).from(users).where(eq(users.role, "user"));
+        } else if (validatedData.audience === NotificationAudience.ADMINS) {
+          targetUsers = await db.select({ id: users.id }).from(users).where(eq(users.role, "admin"));
+        }
+
+        if (targetUsers.length > 0) {
+          await db.insert(notifications).values(
+            targetUsers.map(user => ({
+              userId: user.id,
+              type: "announcement",
+              content: `${validatedData.title}: ${validatedData.message}`,
+            }))
+          );
+        }
+      }
+
+      res.status(201).json(notification[0]);
+    } catch (error: any) {
+      console.error("Create notification error:", error);
+      res.status(400).json({ error: error.message || "Failed to create notification" });
+    }
+  });
+
+  // Helper function to send a notification
+  async function sendNotification(notification: any) {
+    // Send to in-app if applicable
+    if (notification.channel === NotificationChannel.IN_APP || notification.channel === NotificationChannel.BOTH) {
+      let targetUsers: any[] = [];
+      
+      if (notification.audience === NotificationAudience.ALL_USERS) {
+        targetUsers = await db.select({ id: users.id }).from(users);
+      } else if (notification.audience === NotificationAudience.CREATORS) {
+        targetUsers = await db.select({ id: users.id }).from(users).where(eq(users.role, "user"));
+      } else if (notification.audience === NotificationAudience.ADMINS) {
+        targetUsers = await db.select({ id: users.id }).from(users).where(eq(users.role, "admin"));
+      }
+
+      if (targetUsers.length > 0) {
+        await db.insert(notifications).values(
+          targetUsers.map(user => ({
+            userId: user.id,
+            type: "announcement",
+            content: `${notification.title}: ${notification.message}`,
+          }))
+        );
+      }
+    }
+
+    // Update notification status
+    await db
+      .update(adminNotifications)
+      .set({
+        status: NotificationDeliveryStatus.SENT as any,
+        sentAt: new Date(),
+      })
+      .where(eq(adminNotifications.id, notification.id));
+  }
+
+  // Background worker to process scheduled notifications
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const dueNotifications = await db
+        .select()
+        .from(adminNotifications)
+        .where(
+          and(
+            eq(adminNotifications.status, NotificationDeliveryStatus.SCHEDULED as any),
+            sql`${adminNotifications.scheduledFor} <= ${now}`
+          )
+        );
+
+      for (const notification of dueNotifications) {
+        try {
+          await sendNotification(notification);
+          console.log(`Sent scheduled notification: ${notification.title}`);
+        } catch (error) {
+          console.error(`Failed to send notification ${notification.id}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error("Error processing scheduled notifications:", error);
+    }
+  }, 60000); // Check every minute
+
+  app.post("/api/admin/notifications/:notificationId/send", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { notificationId } = req.params;
+      
+      // Get the notification
+      const [notification] = await db
+        .select()
+        .from(adminNotifications)
+        .where(eq(adminNotifications.id, notificationId));
+
+      if (!notification) {
+        return res.status(404).json({ error: "Notification not found" });
+      }
+
+      // Only allow sending scheduled notifications
+      if (notification.status !== NotificationDeliveryStatus.SCHEDULED) {
+        return res.status(400).json({ error: "Only scheduled notifications can be sent manually" });
+      }
+
+      // Send the notification
+      await sendNotification(notification);
+
+      // Fetch and return the updated notification
+      const [updated] = await db
+        .select()
+        .from(adminNotifications)
+        .where(eq(adminNotifications.id, notificationId));
+
+      res.json(updated);
+    } catch (error) {
+      console.error("Send notification error:", error);
+      res.status(500).json({ error: "Failed to send notification" });
+    }
+  });
+
+  app.delete("/api/admin/notifications/:notificationId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { notificationId } = req.params;
+      await db.delete(adminNotifications).where(eq(adminNotifications.id, notificationId));
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete notification error:", error);
+      res.status(500).json({ error: "Failed to delete notification" });
+    }
+  });
+
+  // Innovation Management
+  app.get("/api/admin/innovations", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const innovationList = await db
+        .select({
+          id: innovations.id,
+          title: innovations.title,
+          description: innovations.description,
+          impact: innovations.impact,
+          owner: innovations.owner,
+          status: innovations.status,
+          reviewedBy: innovations.reviewedBy,
+          reviewNotes: innovations.reviewNotes,
+          reviewedAt: innovations.reviewedAt,
+          implementedAt: innovations.implementedAt,
+          createdAt: innovations.createdAt,
+          updatedAt: innovations.updatedAt,
+          ownerUser: {
+            id: users.id,
+            username: users.username,
+            email: users.email,
+          },
+          reviewer: sql<{id: string, username: string, email: string} | null>`
+            CASE WHEN ${innovations.reviewedBy} IS NOT NULL
+            THEN jsonb_build_object(
+              'id', reviewer.id,
+              'username', reviewer.username,
+              'email', reviewer.email
+            )
+            ELSE NULL END
+          `,
+        })
+        .from(innovations)
+        .leftJoin(users, eq(innovations.owner, users.id))
+        .leftJoin(sql`users AS reviewer`, sql`${innovations.reviewedBy} = reviewer.id`)
+        .orderBy(desc(innovations.createdAt));
+
+      res.json(innovationList);
+    } catch (error) {
+      console.error("Get innovations error:", error);
+      res.status(500).json({ error: "Failed to fetch innovations" });
+    }
+  });
+
+  app.post("/api/admin/innovations", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = insertInnovationSchema.parse(req.body);
+      
+      // Check if title already exists
+      const existing = await db
+        .select()
+        .from(innovations)
+        .where(eq(innovations.title, validatedData.title));
+      
+      if (existing.length > 0) {
+        return res.status(400).json({ error: "An idea with this title already exists" });
+      }
+
+      const innovation = await db
+        .insert(innovations)
+        .values({
+          ...validatedData,
+          owner: req.session.userId!,
+        })
+        .returning();
+
+      res.status(201).json(innovation[0]);
+    } catch (error: any) {
+      console.error("Create innovation error:", error);
+      res.status(400).json({ error: error.message || "Failed to create innovation idea" });
+    }
+  });
+
+  app.put("/api/admin/innovations/:innovationId/review", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { innovationId } = req.params;
+      const { status: newStatus, reviewNotes } = req.body;
+
+      if (!newStatus || !Object.values(IdeaStatus).includes(newStatus)) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+
+      // Get current innovation to validate state transition
+      const [current] = await db
+        .select()
+        .from(innovations)
+        .where(eq(innovations.id, innovationId));
+
+      if (!current) {
+        return res.status(404).json({ error: "Innovation idea not found" });
+      }
+
+      // Validate state transitions
+      const currentStatus = current.status;
+      const validTransitions: Record<string, string[]> = {
+        [IdeaStatus.UNDER_REVIEW]: [IdeaStatus.APPROVED, IdeaStatus.REJECTED],
+        [IdeaStatus.APPROVED]: [IdeaStatus.IMPLEMENTED, IdeaStatus.REJECTED],
+        [IdeaStatus.REJECTED]: [IdeaStatus.UNDER_REVIEW],
+        [IdeaStatus.IMPLEMENTED]: [], // Terminal state
+      };
+
+      if (!validTransitions[currentStatus]?.includes(newStatus)) {
+        return res.status(400).json({ 
+          error: `Invalid status transition from ${currentStatus} to ${newStatus}` 
+        });
+      }
+
+      const updateData: any = {
+        status: newStatus,
+        reviewedBy: req.session.userId,
+        reviewedAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      if (reviewNotes) {
+        updateData.reviewNotes = reviewNotes;
+      }
+
+      if (newStatus === IdeaStatus.IMPLEMENTED) {
+        updateData.implementedAt = new Date();
+      }
+
+      const updated = await db
+        .update(innovations)
+        .set(updateData)
+        .where(eq(innovations.id, innovationId))
+        .returning();
+
+      res.json(updated[0]);
+    } catch (error: any) {
+      console.error("Review innovation error:", error);
+      res.status(400).json({ error: error.message || "Failed to review innovation" });
+    }
+  });
+
+  app.delete("/api/admin/innovations/:innovationId", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const { innovationId } = req.params;
+      await db.delete(innovations).where(eq(innovations.id, innovationId));
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete innovation error:", error);
+      res.status(500).json({ error: "Failed to delete innovation" });
+    }
+  });
+
+  // Security Settings
+  app.put("/api/admin/security/password", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = updatePasswordSchema.parse(req.body);
+      
+      // Get current user
+      const [user] = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, req.session.userId!));
+
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Verify current password
+      const isValid = await bcrypt.compare(validatedData.currentPassword, user.password);
+      if (!isValid) {
+        return res.status(400).json({ error: "Current password is incorrect" });
+      }
+
+      // Hash new password
+      const hashedPassword = await bcrypt.hash(validatedData.newPassword, 10);
+
+      // Update password
+      await db
+        .update(users)
+        .set({ password: hashedPassword })
+        .where(eq(users.id, req.session.userId!));
+
+      // Log the action
+      await db.insert(securityLogs).values({
+        userId: req.session.userId!,
+        action: SecurityActionType.UPDATE_PASSWORD,
+        ipAddress: req.ip,
+        userAgent: req.get("user-agent"),
+        details: "Password updated successfully",
+      });
+
+      res.json({ message: "Password updated successfully" });
+    } catch (error: any) {
+      console.error("Update password error:", error);
+      res.status(400).json({ error: error.message || "Failed to update password" });
+    }
+  });
+
+  app.put("/api/admin/security/email", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = updateEmailSchema.parse(req.body);
+      
+      // Get current user
+      const [user] = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, req.session.userId!));
+
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Verify password
+      const isValid = await bcrypt.compare(validatedData.password, user.password);
+      if (!isValid) {
+        return res.status(400).json({ error: "Password is incorrect" });
+      }
+
+      // Check if email is already in use
+      const [existingEmail] = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, validatedData.newEmail));
+
+      if (existingEmail) {
+        return res.status(400).json({ error: "Email already in use" });
+      }
+
+      const oldEmail = user.email;
+
+      // Update email
+      await db
+        .update(users)
+        .set({ email: validatedData.newEmail })
+        .where(eq(users.id, req.session.userId!));
+
+      // Log the action
+      await db.insert(securityLogs).values({
+        userId: req.session.userId!,
+        action: SecurityActionType.UPDATE_EMAIL,
+        ipAddress: req.ip,
+        userAgent: req.get("user-agent"),
+        details: `Email updated from ${oldEmail} to ${validatedData.newEmail}`,
+      });
+
+      res.json({ message: "Email updated successfully" });
+    } catch (error: any) {
+      console.error("Update email error:", error);
+      res.status(400).json({ error: error.message || "Failed to update email" });
+    }
+  });
+
+  // Get security logs
+  app.get("/api/admin/security/logs", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const logs = await db
+        .select()
+        .from(securityLogs)
+        .where(eq(securityLogs.userId, req.session.userId!))
+        .orderBy(desc(securityLogs.createdAt))
+        .limit(50);
+
+      res.json(logs);
+    } catch (error) {
+      console.error("Get security logs error:", error);
+      res.status(500).json({ error: "Failed to fetch security logs" });
+    }
+  });
+
+  // Search Customization Settings
+  app.get("/api/admin/search-settings", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const [settings] = await db
+        .select()
+        .from(searchSettings)
+        .orderBy(desc(searchSettings.updatedAt))
+        .limit(1);
+
+      if (!settings) {
+        // Return default settings if none exist
+        return res.json({
+          rankingAlgorithm: "relevance",
+          enabledFilters: [],
+          theme: "light",
+          accentColor: "#3b82f6",
+          darkModeEnabled: false,
+          featureFlags: [],
+        });
+      }
+
+      res.json(settings);
+    } catch (error) {
+      console.error("Get search settings error:", error);
+      res.status(500).json({ error: "Failed to fetch search settings" });
+    }
+  });
+
+  app.put("/api/admin/search-settings", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+      const validatedData = insertSearchSettingsSchema.parse({
+        ...req.body,
+        updatedBy: req.session.userId!,
+      });
+
+      // Validate ranking algorithm
+      const validRankings = ["relevance", "recent", "popular", "trending"];
+      if (!validRankings.includes(validatedData.rankingAlgorithm)) {
+        return res.status(400).json({ error: "Invalid ranking algorithm" });
+      }
+
+      // Validate theme
+      const validThemes = ["light", "dark", "auto"];
+      if (!validThemes.includes(validatedData.theme)) {
+        return res.status(400).json({ error: "Invalid theme" });
+      }
+
+      // Validate accent color (hex color format)
+      if (!/^#[0-9A-F]{6}$/i.test(validatedData.accentColor)) {
+        return res.status(400).json({ error: "Invalid accent color format. Use hex format (e.g., #3b82f6)" });
+      }
+
+      // Check for existing settings
+      const [existing] = await db
+        .select()
+        .from(searchSettings)
+        .orderBy(desc(searchSettings.updatedAt))
+        .limit(1);
+
+      let result;
+      if (existing) {
+        // Update existing settings
+        [result] = await db
+          .update(searchSettings)
+          .set({
+            ...validatedData,
+            updatedAt: new Date(),
+          })
+          .where(eq(searchSettings.id, existing.id))
+          .returning();
+      } else {
+        // Create new settings
+        [result] = await db
+          .insert(searchSettings)
+          .values(validatedData)
+          .returning();
+      }
+
+      res.json(result);
+    } catch (error: any) {
+      console.error("Update search settings error:", error);
+      res.status(400).json({ error: error.message || "Failed to update search settings" });
+    }
+  });
+
+  const httpServer = createServer(app);
+
+  return httpServer;
+}
