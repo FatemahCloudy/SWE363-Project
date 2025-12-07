@@ -1,6 +1,14 @@
 import jwt from 'jsonwebtoken';
 
-export function auth(req, res, next) {
+export function generateToken(userId) {
+    return jwt.sign(
+        { _id: userId }, 
+        process.env.JWT_SECRET,
+        { expiresIn: '1d' }
+    );
+}
+
+export function protect(req, res, next) {
     const authHeader = req.headers.authorization || '';
     const bearer = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
     const token = bearer || req.cookies?.token;
