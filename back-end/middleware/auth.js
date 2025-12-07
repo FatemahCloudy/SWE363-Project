@@ -23,3 +23,18 @@ export function protect(req, res, next) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
 }
+
+/*for admin*/
+export function authorize(...allowedRoles) {
+    return (req, res, next) => {
+        const userRole = req.user?.role;
+
+        if (!userRole || !allowedRoles.includes(userRole)) {
+            return res.status(403).json({
+                error: 'Forbidden: You do not have permission'
+            });
+        }
+
+        next();
+    };
+}
