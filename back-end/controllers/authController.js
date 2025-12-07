@@ -1,5 +1,5 @@
 import User from '../models/User.js';
-import { generateToken } from '../middleware/auth.js';
+import { auth } from '../middleware/auth.js';
 import { ErrorResponse } from '../middleware/errorHandler.js';
 
 export const signup = async (req, res, next) => {
