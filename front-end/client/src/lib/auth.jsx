@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect } from "react";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { queryClient } from "@/lib/queryClient";
 
 const AuthContext = createContext(undefined);
 
@@ -13,14 +13,9 @@ export function AuthProvider({ children }) {
 
     const checkAuth = async () => {
         try {
-            const response = await apiRequest("GET", "/api/auth/me");
-            const data = await response.json();
-            if (data?.user) {
-                setUser(data.user);
-            } else {
-                setUser(null);
-            }
-        } catch (error) {
+            const userData = localStorage.getItem("memoryplace_user");
+            setUser(userData ? JSON.parse(userData) : null);
+        } catch {
             setUser(null);
         } finally {
             setIsLoading(false);
@@ -28,25 +23,49 @@ export function AuthProvider({ children }) {
     };
 
     const login = async (username, password) => {
-        const response = await apiRequest("POST", "/api/auth/login", { username, password });
-        const data = await response.json();
-        if (data?.user) {
-            setUser(data.user);
+        const users = JSON.parse(localStorage.getItem("memoryplace_users") || "[]");
+        const user = users.find(
+            (u) => u.username === username && u.password === password
+        );
+
+        if (!user) {
+            setUser(null);
+            return;
         }
+
+        const safeUser = { ...user };
+        delete safeUser.password;
+        localStorage.setItem("memoryplace_user", JSON.stringify(safeUser));
+
+        setUser(safeUser);
         await queryClient.invalidateQueries();
     };
 
     const signup = async (username, email, password) => {
-        const response = await apiRequest("POST", "/api/auth/signup", { username, email, password });
-        const data = await response.json();
-        if (data?.user) {
-            setUser(data.user);
-        }
+        const users = JSON.parse(localStorage.getItem("memoryplace_users") || "[]");
+
+        const newUser = {
+            id: crypto.randomUUID(),
+            username,
+            email,
+            password,
+            role: "creator",
+            createdAt: new Date().toISOString(),
+        };
+
+        users.push(newUser);
+        localStorage.setItem("memoryplace_users", JSON.stringify(users));
+
+        const safeUser = { ...newUser };
+        delete safeUser.password;
+        localStorage.setItem("memoryplace_user", JSON.stringify(safeUser));
+
+        setUser(safeUser);
         await queryClient.invalidateQueries();
     };
 
     const logout = async () => {
-        await apiRequest("POST", "/api/auth/logout");
+        localStorage.removeItem("memoryplace_user");
         setUser(null);
         await queryClient.clear();
     };
